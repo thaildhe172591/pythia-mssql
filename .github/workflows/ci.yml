@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/checkout-core
+        with:
+          token: ${{ secrets.PYTHIA_CORE_TOKEN || github.token }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      # nothing to install: the suite stands in for pymssql and finds core's src/
+      - run: python -m compileall -q src tests
+      - run: python tests/test_mssql.py
+        env:
+          PYTHIA_CORE_SRC: ${{ github.workspace }}/.core/src
+
+  live:
+    # a disposable server per run; never a shared one
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "CiOnly#Disposable1"
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa
+          -P CiOnly#Disposable1 -Q 'select 1' -b"
+          --health-interval 10s --health-timeout 5s --health-retries 24
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/checkout-core
+        with:
+          token: ${{ secrets.PYTHIA_CORE_TOKEN || github.token }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install ./.core .
+      - run: python tests/live_check.py
+        env:
+          PYTHIA_MSSQL_LIVE_HOST: 127.0.0.1
+          PYTHIA_MSSQL_LIVE_PORT: "1433"
+          PYTHIA_MSSQL_LIVE_USER: sa
+          PYTHIA_MSSQL_LIVE_PASSWORD: "CiOnly#Disposable1"
+          PYTHIA_MSSQL_LIVE_DISPOSABLE: "1"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/checkout-core
+        with:
+          token: ${{ secrets.PYTHIA_CORE_TOKEN || github.token }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip wheel . --no-deps -w dist
+      - run: pip install ./.core dist/*.whl
+      # the console script and the queries must work outside the repo layout
+      - run: cd /tmp && pythia-mssql version && pythia-mssql --help | grep -q impact
+      - run: cd /tmp && python -c "from pythia_mssql.catalog import QUERY_BINDS, QUERY_DIR; assert all((QUERY_DIR / q).is_file() for q in QUERY_BINDS)"

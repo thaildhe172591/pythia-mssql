@@ -1,0 +1,13 @@
+{
+  "default": "dev",
+
+  "dev": {
+    "host": "",
+    "port": 1433,
+    "database": "",
+    "user": "",
+    "password": "",
+    "schema": "app_owner",
+    "encrypt": "request"
+  }
+}
