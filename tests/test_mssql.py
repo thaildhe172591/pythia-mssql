@@ -500,6 +500,18 @@ def test_a_script_splits_at_go_and_a_module_takes_its_whole_batch():
     assert got[0][1].startswith("-- release 7\ncreate or alter procedure") and got[0][1].endswith("end")
     assert got[2][1] == "update t set note = N'go; here' where id = 1"
     assert [write.classify(t)[0] for _, t in got] == ["source", "structural", "data_dml", "comments"]
+    # a module that does not open its batch still takes the rest of it, as its
+    # body would in SQL Server — never cut at a ';' inside that body
+    got = write.split_script("alter table t add c int;\ncreate procedure p as\nbegin\n"
+                             "  select 1;\n  select 2;\nend;\nGO\nupdate t set c = 1;")
+    assert got == [(1, "alter table t add c int"),
+                   (2, "create procedure p as\nbegin\n  select 1;\n  select 2;\nend;"),
+                   (8, "update t set c = 1")], got
+    # GO n runs its batch n times: named at its own line, and refused
+    got = write.split_script("update t set x = x + 1 where id = 1;\n\nGO 2\n")
+    assert got == [(1, "update t set x = x + 1 where id = 1"), (3, "GO 2")], got
+    group, why = write.classify("GO 2")
+    assert group is None and "runs its batch 2 times" in why and "once" in why, why
     assert write.split_script("-- only a comment\nGO\n") == []
     assert write.split_script("select 'GO\nGO'") == [(1, "select 'GO\nGO'")]   # GO in a string
 
@@ -921,6 +933,254 @@ def test_the_engine_answers_the_write_tier():
     notes = SqlServerEngine.rollback_notes
     assert set(notes) == set(policy.GROUPS) and all(notes.values()), notes
     assert notes["data_dml"].startswith("No") and notes["source"].startswith("Yes")
+
+
+# --- Phase 4c: the harness, release and lint tiers, and the skill pack ------------------
+
+from pythia_core import harness, skills as skill_contract  # noqa: E402
+
+SKILL_NAMES = ("using-pythia-mssql", "pythia-mssql-apply", "pythia-mssql-autopilot",
+               "pythia-mssql-deploy", "pythia-mssql-explore", "pythia-mssql-impact",
+               "pythia-mssql-verify")
+
+
+@contextlib.contextmanager
+def scratch_project():
+    keep = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("PYTHIA_")}
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td).resolve()
+        cfg = root / ".pythia" / "mssql" / "connections.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(json.dumps({"dev": {"host": "localhost", "database": "app",
+                                           "user": "u", "schema": "app_owner"}}),
+                       encoding="utf-8")
+        try:
+            yield root
+        finally:
+            os.environ.update(keep)
+
+
+def guard(root, command, tool="Bash"):
+    tin = {"command": command} if tool == "Bash" else {"sql": command}
+    out = harness.pre_tool_decision(SqlServerEngine(), {
+        "tool_name": tool, "tool_input": tin, "cwd": str(root)})
+    return out and out["hookSpecificOutput"]["permissionDecision"]
+
+
+def test_the_engine_answers_the_harness_release_and_lint_tiers():
+    assert engine_problems(SqlServerEngine(), tiers=(
+        "connect", "read", "write", "harness", "release", "lint")) == []
+    assert SqlServerEngine().split_script("update t set x = 1 where id = 1;\nGO\n"
+                                          "delete from t where id = 2") == [
+        (1, "update t set x = 1 where id = 1"), (3, "delete from t where id = 2")]
+
+
+def test_the_guard_denies_sqlcmd_writing_around_the_gate():
+    with scratch_project() as root:
+        for cmd in ('sqlcmd -S db -d app -Q "drop table app_owner.t_order"',
+                    'sqlcmd -Q "CREATE OR ALTER PROCEDURE p AS SELECT 1"',
+                    'SQLCMDPASSWORD=x sqlcmd -S localhost -U sa -Q "update t_order set status = 1"',
+                    'sqlcmd -Q "update top (10) t_order set status = 1"',
+                    'sqlcmd -d app -Q "delete t_order where id = 1"',
+                    'sqlcmd -d app -Q "insert t_order values (1)"',
+                    'sqlcmd -d app -Q "truncate table t_order"',
+                    "sqlcmd -d app -Q \"exec sp_rename 't_order', 't_orders'\"",
+                    "sqlcmd -d app -Q \"sp_rename 't_order', 't_orders'\"",
+                    'sqlcmd -d app -Q "exec app_owner.p_order_paid 1"',
+                    'sqlcmd -d app -Q "execute app_owner.p_order_paid @id = 1"',
+                    'sqlcmd -d app -Q "merge t_order using s on 1 = 1 when matched then delete;"',
+                    'sqlcmd -d app -Q "select * into t_copy from t_order"',
+                    'sqlcmd -d app -Q "select next value for app_owner.seq_order"',
+                    'sqlcmd -d app -Q "grant select on t_order to app_ro"',
+                    'sqlcmd -d app -Q "deny select on t_order to app_ro"',
+                    'sqlcmd -d app -Q "dbcc checkident (t_order, reseed, 0)"',
+                    "sqlcmd -Q \"backup database app to disk = 'x.bak'\"",
+                    'sqlcmd -d app -Q ":r release.sql"',
+                    'sqlcmd -d app -Q "create index ix_note on t_order (note)"',
+                    'sqlcmd -d app -Q "alter table t_order add note int"',
+                    'sqlcmd -d app -Q "revoke select on t_order from app_ro"',
+                    "sqlcmd -Q \"restore database app from disk = 'x.bak'\"",
+                    'sqlcmd -Q "reconfigure"', 'sqlcmd -Q "kill 52"', 'sqlcmd -Q "shutdown"',
+                    'sqlcmd -d app -Q "disable trigger trg_order_audit on t_order"',
+                    'sqlcmd -d app -Q "enable trigger trg_order_audit on t_order"',
+                    "sqlcmd -S db -d app -i release.sql", "sqlcmd -irelease.sql -d app",
+                    "sqlcmd --input-file release.sql", "sqlcmd -d app < release.sql",
+                    "cat release.sql | sqlcmd -d app", "osql -E -i release.sql",
+                    "bcp app.dbo.t_order in orders.dat -S db -T",
+                    "Invoke-Sqlcmd -InputFile release.sql -ServerInstance db",
+                    'Invoke-Sqlcmd -Query "drop table t_order" -ServerInstance db',
+                    "sqlpackage /Action:Publish /SourceFile:app.dacpac",
+                    "sqlpackage /a:Import /SourceFile:app.bacpac",
+                    "/opt/mssql-tools18/bin/sqlcmd -Q 'drop view v_order'",
+                    'docker exec db /opt/mssql-tools18/bin/sqlcmd -Q "drop table t_order"'):
+            assert guard(root, cmd) == "deny", cmd
+
+
+def test_the_guard_leaves_sqlcmd_reads_to_the_client():
+    with scratch_project() as root:
+        for cmd in ('sqlcmd -S db -d app -Q "select count(*) from t_order"',
+                    'sqlcmd -I -d app -Q "select id from t_order where total < 10"',
+                    "sqlcmd -?", "sqlcmd --version",
+                    'bcp "select id from app.dbo.t_order" queryout ids.dat -S db -T',
+                    "sqlpackage /Action:Extract /TargetFile:app.dacpac",
+                    'sqlcmd -d app -Q "select updated_at, created_by, is_deleted from t_order"'):
+            assert guard(root, cmd) is None, cmd
+        assert guard(root, 'pythia-mssql ls "t_order%"') == "allow"
+        assert guard(root, "DROP TABLE t_order", tool="mcp__mssql__query") == "deny"
+        assert guard(root, "EXEC dbo.p_settle", tool="mcp__mssql__execute_sql") == "deny"
+        assert guard(root, "select 1", tool="mcp__mssql__query") is None
+
+
+def test_install_scaffolds_the_example_config():
+    example = json.loads((ROOT / "examples" / "connections.example.json")
+                         .read_text(encoding="utf-8"))
+    assert SqlServerEngine().connections_template() == example
+
+
+def test_the_skill_pack_holds_the_contract_and_routes_every_skill():
+    pack = skill_contract.pack(SqlServerEngine().skills_dir())
+    assert tuple(sorted(p.name for p in pack)) == tuple(sorted(SKILL_NAMES))
+    for skill in pack:
+        assert skill_contract.lint(skill / "SKILL.md") == [], skill.name
+    router = (SqlServerEngine().skills_dir() / "using-pythia-mssql" / "SKILL.md") \
+        .read_text(encoding="utf-8")
+    for name in SKILL_NAMES[1:]:
+        assert f"`{name}`" in router, f"the router never routes to {name}"
+    for named in set(re.findall(r"`(pythia-mssql-[a-z-]+)`", router)):
+        assert named in SKILL_NAMES, f"the router names a skill that is not shipped: {named}"
+    text = "\n".join((s / "SKILL.md").read_text(encoding="utf-8") for s in pack)
+    assert "pythia-mssql approve <token>" in text and "--confirm <token>" in text
+    assert "WRITTEN?" in text and "sqlcmd" in text
+    apply_skill = (SqlServerEngine().skills_dir() / "pythia-mssql-apply" / "SKILL.md") \
+        .read_text(encoding="utf-8")
+    doors = [apply_skill.index(d) for d in (
+        "AskUserQuestion", "pythia_mssql_approve", "pythia-mssql approve <token>")]
+    assert doors == sorted(doors), "the apply skill names the doors out of order"
+    assert "pythia-mssql approve --card <token>" in apply_skill
+
+
+def test_the_skills_ship_in_the_wheel():
+    toml = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    for glob in ('"skills/*/SKILL.md"', '"skills/*/reference/*.md"'):
+        assert glob in toml, f"package-data misses {glob}"
+
+
+def test_the_mcp_approver_answers_as_a_real_process():
+    import subprocess
+    core_src = pathlib.Path(sys.modules["pythia_core"].__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), str(core_src)])}
+    session = "".join(json.dumps(m) + "\n" for m in (
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "pythia_mssql_approve", "arguments": {"token": "abc123"}}}))
+    with tempfile.TemporaryDirectory() as td:
+        r = subprocess.run([sys.executable, "-m", "pythia_mssql", "mcp"],
+                           input=session, capture_output=True, text=True, cwd=td,
+                           env=env, timeout=60)
+    assert r.returncode == 0, r.stderr
+    out = [json.loads(line) for line in r.stdout.splitlines()]
+    assert out[0]["result"]["serverInfo"]["name"] == "pythia_mssql"
+    assert [t["name"] for t in out[1]["result"]["tools"]] == ["pythia_mssql_approve"]
+    assert out[2]["result"]["isError"]                    # no such preview: nothing minted
+    assert "no pending preview" in out[2]["result"]["content"][0]["text"].lower()
+
+
+def lint_ids(*statements):
+    """{(rule, statement index, line)} over a change of statements."""
+    from pythia_core import lint
+    stmts = [{"file": "f.sql", "line": 1, "text": t, "group": write.classify(t)[0],
+              "n": i + 1} for i, t in enumerate(statements)]
+    found = lint.run(SqlServerEngine(), {"severity": {}, "naming": {}}, stmts)
+    return {(f["rule"], f["n"], f["line"]) for f in found}, found
+
+
+def rules_of(*statements):
+    return {r for r, _, _ in lint_ids(*statements)[0]}
+
+
+def test_lint_refuses_a_trigger_that_commits():
+    bad = ("create trigger app_owner.trg_pay on app_owner.t_order after update as\n"
+           "begin\n  insert into app_owner.t_order_audit (order_id) select id from inserted;\n"
+           "  commit;\nend")
+    ids, found = lint_ids(bad)
+    assert ("mssql-trigger-commit", 1, 4) in ids, ids
+    assert next(f for f in found if f["rule"] == "mssql-trigger-commit")["severity"] == "error"
+    assert "mssql-trigger-commit" not in rules_of(bad.replace("commit;", "-- never commit here"))
+    assert "mssql-trigger-commit" not in rules_of(
+        "create procedure app_owner.p_batch as\nbegin\n  set nocount on;\n"
+        "  begin tran;\n  update t_order set total = 0 where id = 1;\n  commit;\nend")
+
+
+def test_lint_catches_a_string_type_without_a_length():
+    ids, found = lint_ids("create table app_owner.t_note (\n  id int,\n  code varchar,\n"
+                          "  name nvarchar(40),\n  tag char,\n  body varchar(max)\n)")
+    got = {(r, ln) for r, _, ln in ids}
+    assert {("mssql-unsized-string", 3), ("mssql-unsized-string", 5)} <= got, got
+    assert not {("mssql-unsized-string", 4), ("mssql-unsized-string", 6)} & got, got
+    assert next(f for f in found if f["rule"] == "mssql-unsized-string")["severity"] == "error"
+    assert ("mssql-unsized-string", 1, 2) in lint_ids(
+        "create procedure app_owner.p_tag @tag nvarchar(20) as\n"
+        "select cast(@tag as varchar) as tag")[0]
+    assert ("mssql-unsized-string", 1, 1) in lint_ids(
+        "update t_order set note = cast(total as varchar) where id = 1")[0]
+    assert "mssql-unsized-string" not in rules_of(
+        "create procedure app_owner.p_c as select char(65) as c, "
+        "charindex('a', 'varchar') as i, cast(1 as varchar(10)) as s")
+
+
+def test_lint_reads_dirty_reads_star_selects_and_not_in():
+    ids, _ = lint_ids("create view app_owner.v_order as\nselect * from app_owner.t_order with (nolock)",
+                      "create procedure app_owner.p_open as\nbegin\n  set nocount on;\n"
+                      "  set transaction isolation level read uncommitted;\n"
+                      "  select o.* from t_order o\n"
+                      "  where o.id not in (select order_id from t_order_line);\nend",
+                      "delete from t_order where id not in (select order_id from t_paid)")
+    assert {("mssql-select-star", 1, 2), ("mssql-nolock", 1, 2), ("mssql-nolock", 2, 4),
+            ("mssql-select-star", 2, 5), ("mssql-not-in-subquery", 2, 6),
+            ("mssql-not-in-subquery", 3, 1)} <= ids, ids
+    clean = rules_of("create procedure app_owner.p_n as\nbegin\n  set nocount on;\n"
+                     "  if exists (select * from t_order) select count(*) as n from t_order "
+                     "where id not in (1, 2) and status <> 'select * from x with (nolock)';\nend")
+    assert not clean, clean
+
+
+def test_lint_reads_column_types_sql_server_warns_about():
+    ids, found = lint_ids("create table app_owner.t_doc (\n  id int,\n  body text,\n"
+                          "  pic image null,\n  note ntext not null,\n  at datetime,\n"
+                          "  at2 datetime2(3),\n  day smalldatetime,\n  [text] varchar(10)\n)")
+    got = {(r, ln) for r, _, ln in ids}
+    assert {("mssql-deprecated-type", 3), ("mssql-deprecated-type", 4),
+            ("mssql-deprecated-type", 5), ("mssql-datetime", 6),
+            ("mssql-datetime", 8)} <= got, got
+    assert not any(ln in (2, 7, 9) for r, ln in got if r != "mssql-table-comment"), got
+    assert {f["severity"] for f in found if f["rule"] == "mssql-datetime"} == {"info"}
+
+
+def test_lint_reads_how_procedures_are_named_and_counted():
+    assert "mssql-sp-prefix" in rules_of("create procedure app_owner.sp_close as\n"
+                                         "begin\n  set nocount on;\nend")
+    assert "mssql-sp-prefix" not in rules_of("create procedure app_owner.p_close as\n"
+                                             "begin\n  set nocount on;\nend")
+    assert "mssql-nocount" in rules_of("create procedure app_owner.p_close as\n"
+                                       "update t_order set status = 'PAID' where id = 1")
+    assert "mssql-nocount" not in rules_of(
+        "create function app_owner.f_x() returns int as begin return 1 end")
+
+
+def test_lint_asks_for_an_ms_description_on_every_new_table():
+    table = "create table app_owner.t_note (id int)"
+    prop = ("exec sys.sp_addextendedproperty @name = N'MS_Description', @value = N'notes', "
+            "@level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE', "
+            "@level1name = N'{}'")
+    assert ("mssql-table-comment", 1, 1) in lint_ids(table)[0]
+    assert "mssql-table-comment" not in rules_of(table, prop.format("t_note"))
+    assert "mssql-table-comment" not in rules_of(
+        "create table [app_owner].[T_Note] (id int)", prop.format("t_note"))
+    assert ("mssql-table-comment", 1, 1) in lint_ids(table, prop.format("t_other"))[0]
+    column = prop.format("t_note") + ", @level2type = N'COLUMN', @level2name = N'id'"
+    assert ("mssql-table-comment", 1, 1) in lint_ids(table, column)[0]
 
 
 def main():

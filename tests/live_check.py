@@ -12,7 +12,8 @@
    approve, confirm and restore; a new object undone by a DROP; rows that
    move; a comment; a DROP COLUMN that breaks a view, a verification that
    moved, written-but-broken; and triggers that COMMIT or ROLLBACK inside
-   the rehearsal.
+   the rehearsal. Then a release in GO batches through `deploy`, a lint
+   error in a real preview, and a write under an autopilot lease.
 
 Never point this at a shared server: it creates a login and drops a
 database. Skipped unless PYTHIA_MSSQL_LIVE_HOST is set:
@@ -291,6 +292,9 @@ def check_writes(entry):
         _rows_and_comments(entry, p)
         _breakage(entry, p)
         _triggers(entry, p)
+        _release(entry, p)
+        _lint(entry, p)
+        _lease(entry, p)
     finally:
         human.FORCE_CONSOLE = None
 
@@ -453,6 +457,113 @@ def _triggers(entry, p):
     finally:
         run_batches(entry, DB, "drop trigger ddl_hold on database")
     ok("a DDL trigger's COMMIT commits nothing either")
+
+
+RELEASE = """-- release 7: a note on every order
+alter table app_owner.t_order add note nvarchar(40) null;
+GO
+update app_owner.t_order set note = N'first' where id = 1;
+exec sys.sp_addextendedproperty @name = N'MS_Description', @value = N'free text',
+    @level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE',
+    @level1name = N't_order', @level2type = N'COLUMN', @level2name = N'note';
+GO
+create or alter procedure app_owner.p_order_note @id bigint as
+begin
+    set nocount on;
+    select note from app_owner.t_order where id = @id;
+end
+GO
+"""
+HAS_NOTE = "select count(*) from sys.columns where object_id = object_id('app_owner.t_order') " \
+           "and name = 'note'"
+
+
+def _release(entry, p):
+    """deploy: GO batches, rehearsed as one transaction, landed as one, or not at all."""
+    p.policy(data_dml="confirm", structural="confirm")
+    p.file("rel.sql", RELEASE)
+    code, doc, why = p.confirm("deploy", "rel.sql")
+    assert code == 0, (why, doc)
+    assert [(m["line"], m["group"]) for m in doc["members"]] == [
+        (2, "structural"), (4, "data_dml"), (5, "comments"), (9, "source")], doc["members"]
+    # the UPDATE was rehearsed against the column the release adds before it
+    assert doc["members"][1]["row_set"]["count"] == 1, doc["members"][1]
+    assert scalar(entry, HAS_NOTE) == 0
+    ok("deploy previews GO batches as one transaction: DML on the column it adds")
+
+    code, _, why = p.run("approve", "--card", doc["members"][1]["token"])
+    assert code == 1 and "approved as a whole" in why, why
+    p.approve(doc["batch"])
+    run_batches(entry, DB, "update app_owner.t_order set total = total + 1 where id = 1")
+    code, _, why = p.confirm("deploy", "rel.sql", "--confirm", doc["batch"])
+    assert code == 1 and "statement 2" in why and "nothing was written" in why.lower(), why
+    assert scalar(entry, HAS_NOTE) == 0           # statement 1 did not land either
+    ok("a release whose rows moved after approval rolls back whole")
+
+    code, doc, why = p.confirm("deploy", "rel.sql")
+    p.approve(doc["batch"])
+    code, res, why = p.confirm("deploy", "rel.sql", "--confirm", doc["batch"])
+    assert code == 0 and res["applied"], (why, res)
+    assert scalar(entry, "select note from app_owner.t_order where id = 1") == "first"
+    assert comment(entry, "note") == "free text"
+    assert scalar(entry, "select object_id('app_owner.p_order_note')") is not None
+    ok("an approved release lands whole, in one commit")
+
+    p.file("bad.sql", "alter table app_owner.t_order add note2 int;\nGO\n"
+                      "update app_owner.t_order set nope = 1 where id = 1;\n")
+    code, _, why = p.run("deploy", "bad.sql")
+    assert code == 1 and "bad.sql:3" in why and "nope" in why, why
+    assert scalar(entry, "select count(*) from sys.columns where object_id = "
+                         "object_id('app_owner.t_order') and name = 'note2'") == 0
+    ok("a release that fails at statement 2 keeps nothing of statement 1")
+
+
+def _lint(entry, p):
+    code, doc, why = p.confirm("apply", p.file("tag.sql", (
+        "create or alter procedure app_owner.p_tag @id bigint as\n"
+        "begin\n    set nocount on;\n    declare @tag varchar;\n"
+        "    select @tag = status from app_owner.t_order where id = @id;\n"
+        "    select @tag as tag;\nend")))
+    assert code == 0, why
+    found = [(f["rule"], f["line"], f["severity"]) for f in doc["lint"]]
+    assert ("mssql-unsized-string", 4, "error") in found, found
+    code, _, why = p.run("lint", "tag.sql")
+    assert code == 1, why
+    ok("lint: an unsized varchar is an error in a real preview, and lint exits 1")
+
+
+def _lease(entry, p):
+    """autopilot: one approved lease lands covered writes, and nothing else."""
+    from pythia_core import human
+    code, doc, why = p.confirm("autopilot", "request", "--groups", "comments",
+                               "--max-writes", "2")
+    assert code == 0 and len(doc["token"]) == 8, why
+    text = ("exec sys.sp_updateextendedproperty @name = N'MS_Description', "
+            "@value = N'orders, under a lease', @level0type = N'SCHEMA', "
+            "@level0name = N'app_owner', @level1type = N'TABLE', @level1name = N't_order'")
+    code, doc2, _ = p.confirm("apply", p.file("c1.sql", text))
+    assert code == 0 and doc2["will_apply"] is False         # a request is no lease
+    human.FORCE_CONSOLE = True
+    try:
+        code, _, why = p.run("approve", doc["token"])
+        assert code == 0, why
+    finally:
+        human.FORCE_CONSOLE = False
+    code, res, why = p.confirm("apply", "c1.sql")
+    assert code == 0 and res["applied"] and res["confirmed_via"] == "autopilot", (why, res)
+    assert scalar(entry, "select cast(value as nvarchar(4000)) from sys.extended_properties "
+                         "where major_id = object_id('app_owner.t_order') and minor_id = 0 "
+                         "and name = 'MS_Description'") == "orders, under a lease"
+    code, doc3, why = p.confirm("apply", p.file("s1.sql", "alter table app_owner.t_order "
+                                                          "add under_lease int"))
+    assert code == 0 and doc3["will_apply"] is False, why
+    assert "does not cover structural" in doc3["autopilot"]["why"], doc3["autopilot"]
+    assert scalar(entry, "select count(*) from sys.columns where object_id = "
+                         "object_id('app_owner.t_order') and name = 'under_lease'") == 0
+    code, report, _ = p.confirm("autopilot", "report")
+    assert [w["verdict"] for w in report["writes"]] == ["ok"], report
+    assert p.run("autopilot", "off")[0] == 0
+    ok("autopilot: an approved lease lands a covered write, and only that")
 
 
 def main():

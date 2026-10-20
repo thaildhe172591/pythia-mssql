@@ -1,13 +1,15 @@
 """SQL Server, through pymssql, as a pythia-core engine.
 
-It answers the connect tier (here), the read tier (read.py) and the write
-tier (write.py). SQL Server runs DDL inside a transaction, as PostgreSQL
+It answers the connect tier (here), the read tier (read.py), the write and
+release tiers (write.py), the lint tier (rules.py) and the harness tier
+(guard.py). SQL Server runs DDL inside a transaction, as PostgreSQL
 does, so every statement is rehearsed — run, verified by binding the
 modules around it, rolled back — before anyone approves it.
 """
+import copy
 import sys
 
-from . import __version__, read, write
+from . import __version__, guard, read, write
 from .catalog import QUERY_BINDS, QUERY_DIR, fold, q  # noqa: F401 — QUERY_* re-exported
 
 CONFIG_REL = ".pythia/mssql/connections.json"
@@ -186,3 +188,31 @@ class SqlServerEngine:
 
     def privilege_warning(self, conn, schema):
         return write.privilege_warning(conn, schema)
+
+    # --- the release tier (write.py) ---------------------------------------------
+
+    def split_script(self, text):
+        return write.split_script(text)
+
+    # --- the lint tier (rules.py) ------------------------------------------------
+
+    def lint_rules(self):
+        from . import rules
+        return list(rules.RULES)
+
+    # --- the harness tier (guard.py) ---------------------------------------------
+
+    def raw_client_pattern(self):
+        return guard.CLIENTS
+
+    def write_sql_pattern(self):
+        return guard.WRITE_SQL
+
+    def script_pattern(self):
+        return guard.SCRIPT
+
+    def connections_template(self):
+        return copy.deepcopy(guard.TEMPLATE)
+
+    def skills_dir(self):
+        return guard.SKILLS_DIR

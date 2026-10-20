@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.0.dev0 — unreleased
+
+Phase 4c of the plan in pythia-core's DESIGN.md: the harness, release and
+lint tiers, and the skill pack. Phase 4 is complete.
+
+- **The guard (`guard.py`):** `sqlcmd`, `osql`, `isql`, `mssql-cli` and
+  `Invoke-Sqlcmd` given write SQL — DDL, DML with or without INTO and FROM,
+  `EXEC` and any `sp_` or `xp_` procedure (first in a batch it needs no
+  EXEC), `SELECT ... INTO`, `NEXT VALUE FOR`, `:r` — or a script (`-i`,
+  `--input-file`, `-InputFile`, `< file`, a pipe; `-I` is not a script);
+  `bcp ... in`; `sqlpackage` Publish and Import. Denied behind `docker
+  exec`, `ssh`, `sudo` and `bash -c` too; reads are left to the client.
+- **`install`, `doctor`, `hook`, `mcp`, `skill lint`** over pythia-core,
+  field-tested in a scratch project: `doctor` passes, the brief carries the
+  STATE lines, the guard denies `sqlcmd -Q "drop table ..."` and allows a
+  pythia-mssql read.
+- **`deploy`:** a release cut at `GO` lines and then at `;`, a module's body
+  running to the end of its batch (never cut at a `;` inside it), rehearsed
+  and committed as one transaction under one approval. `GO n` is refused.
+- **`lint` and ten T-SQL rules:** a trigger that commits and a string type
+  without a length (errors); NOLOCK, `SELECT *` in stored code, `NOT IN
+  (SELECT ...)`, `text`/`ntext`/`image`, a procedure named `sp_`, a new table
+  without an MS_Description (warnings); `datetime` and a procedure without
+  `SET NOCOUNT ON` (notes).
+- **Seven skills:** `using-pythia-mssql` (the router),
+  `pythia-mssql-explore`, `-impact`, `-apply` (with its refusals), `-deploy`,
+  `-autopilot`, `-verify` — `WRITTEN?` named where it can appear.
+- **The live check** also deploys a release in GO batches (rows that move
+  roll it back whole; a failure at statement 2 keeps nothing), sees a lint
+  error in a real preview, and lands a write under an autopilot lease.
+- Tests for every guard word and rule, mutation-checked.
+
 ## 0.2.0.dev0 — unreleased
 
 Phase 4b of the plan in pythia-core's DESIGN.md: SQL Server's write tier,

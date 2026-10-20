@@ -98,25 +98,28 @@ _MODULE = re.compile(r"\s*(?:create(?:\s+or\s+alter)?|alter)\s+"
 
 
 def _batches(text):
-    """(offset, batch, repeat) between GO lines, read where no string or
-    comment hides them."""
+    """(offset, batch, repeat, where its GO stands) between GO lines, read
+    where no string or comment hides them."""
     masked = lex(text).masked
     out, start = [], 0
     for m in _GO.finditer(masked):
-        out.append((start, text[start:m.start()], int(m.group(1) or 1)))
+        go = m.start() + len(m.group(0)) - len(m.group(0).lstrip())
+        out.append((start, text[start:m.start()], int(m.group(1) or 1), go))
         start = m.end()
-    out.append((start, text[start:], 1))
+    out.append((start, text[start:], 1, len(text)))
     return out
 
 
 def _pieces(offset, batch):
-    """(offset, statement) in one batch: a module takes the whole batch,
-    anything else ends at its ';'."""
+    """(offset, statement) in one batch: anything ends at its ';', but a
+    module's body runs to the end of the batch, as in SQL Server."""
     lexed = lex(batch)
-    if _MODULE.match(lexed.masked):
-        return [(offset, batch)] if lexed.masked.strip() else []
     out, start = [], 0
     for cut in lexed.cuts + [len(batch)]:
+        if _MODULE.match(lexed.masked[start:]):
+            # a module's body runs to the end of its batch, ';' or not
+            out.append((offset + start, batch[start:]))
+            return out
         if lexed.masked[start:cut].strip():
             out.append((offset + start, batch[start:cut]))
         start = cut + 1
@@ -128,13 +131,13 @@ def split_script(text):
     Server's tools cut it: at GO lines, then at ';' outside a module. The
     line is where the statement's code starts."""
     out = []
-    for offset, batch, repeat in _batches(text):
+    for offset, batch, repeat, go in _batches(text):
         for start, piece in _pieces(offset, batch):
             code = lex(piece).masked
             first = start + len(code) - len(code.lstrip())
             out.append((text.count("\n", 0, first) + 1, piece.strip()))
         if repeat != 1:
-            out.append((text.count("\n", 0, offset) + 1, f"GO {repeat}"))
+            out.append((text.count("\n", 0, go) + 1, f"GO {repeat}"))
     return out
 
 
@@ -264,8 +267,13 @@ def classify(text):
     if lexed.unterminated:
         return None, ("The file ends inside a quote, a [bracket] or a comment, "
                       "so it cannot be read safely — refused.")
+    repeats = [b[2] for b in _batches(text) if b[2] != 1]
+    if repeats:
+        return None, (f"GO {repeats[0]} runs its batch {repeats[0]} times; "
+                      "pythia runs every statement once, as it was previewed. "
+                      "Write each statement out in the script instead.")
     batches = [b for b in _batches(text) if lex(b[1]).masked.strip()]
-    if len(batches) > 1 or any(b[2] != 1 for b in _batches(text)):
+    if len(batches) > 1:
         return None, ("GO separates batches in a script: apply takes one "
                       "statement per file, and deploy takes a script.")
     stmts = split_statements(text)

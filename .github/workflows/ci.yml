@@ -73,3 +73,4 @@ jobs:
       # the console script and the queries must work outside the repo layout
       - run: cd /tmp && pythia-mssql version && pythia-mssql --help | grep -q impact
       - run: cd /tmp && python -c "from pythia_mssql.catalog import QUERY_BINDS, QUERY_DIR; assert all((QUERY_DIR / q).is_file() for q in QUERY_BINDS)"
+      - run: cd /tmp && python -c "from pythia_mssql.guard import SKILLS_DIR as d; assert len(list(d.glob('*/SKILL.md'))) == 7 and (d / 'pythia-mssql-apply' / 'reference' / 'refusals.md').is_file()"

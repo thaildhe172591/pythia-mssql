@@ -8,12 +8,16 @@ PostgreSQL: the agent learns from the live catalog, asks a person before
 any write, and writes only through a gate that snapshots, verifies and
 reports honestly.
 
-**Pre-alpha (Phase 4b).** It reads everything pythia's Learn movement
-needs, and writes through one gate.
+**Pre-alpha (Phase 4c).** It reads everything pythia's Learn movement
+needs, writes through one gate, and wires a project for an agent: the
+guard, the session brief, the approval doors and the `pythia-mssql-*`
+skills.
 
-| Works today | Next |
-|---|---|
-| `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections`; `apply`, `approve`, `journal`, `policy` | the harness — guard, `install`, `doctor`, the chat doors and skills — with `deploy`, autopilot and lint (4c) |
+| Works today |
+|---|
+| reads: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` |
+| writes: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
+| the harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
 ## Install (from git while pre-alpha)
 
@@ -24,6 +28,54 @@ pip install "git+https://github.com/thaildhe172591/pythia-core" \
 
 That brings [pymssql](https://pypi.org/project/pymssql/), whose wheels carry
 FreeTDS: no ODBC driver needs installing, on Windows, macOS or Linux.
+
+## Set up a project for an agent
+
+```bash
+cd your-project
+pythia-mssql install     # once; a second run changes nothing
+pythia-mssql doctor      # is everything wired? exit 1 names what is not
+```
+
+`install` writes, and leaves everything else as it was:
+
+- `.pythia/mssql/connections.json`, mode 600, created once from the
+  template — the developer fills in the passwords; an agent never opens it;
+- `.gitignore` lines for that file, this machine's approvals
+  (`.pythia/mssql/grants/`) and `.claude/settings.local.json`;
+- `.claude/settings.local.json`: the hooks (the guard, the session brief,
+  the AskUserQuestion answer), spelled with this interpreter's absolute path
+  so they start whether or not a virtual environment is active, and deny
+  rules for the engine's files;
+- the MCP approver `pythia_mssql` (tool `pythia_mssql_approve`), in this
+  machine's files only: Claude Code's local scope for the project
+  (`~/.claude.json`) and Codex's `~/.codex/config.toml`, each when that
+  client has run here;
+- a `pythia-mssql` block in CLAUDE.md and AGENTS.md (other tools' blocks,
+  and the developer's own text, are left alone);
+- the skills, in `.claude/skills` and `.agents/skills`:
+  `using-pythia-mssql` (the router), `pythia-mssql-explore`,
+  `pythia-mssql-impact`, `pythia-mssql-apply`, `pythia-mssql-deploy`,
+  `pythia-mssql-autopilot`, `pythia-mssql-verify`.
+
+Restart the agent's session after installing, so the hooks load. Each
+session then starts with the rules and a `STATE` line (connections, the
+write policy). Before every tool call the guard decides:
+
+| The agent runs | The guard |
+|---|---|
+| `sqlcmd`, `osql` or `Invoke-Sqlcmd` given write SQL (DDL, DML, `EXEC`, any `sp_` or `xp_` procedure, `SELECT ... INTO`, `NEXT VALUE FOR`, `:r`), a script (`-i`, `-InputFile`, `< file`, a pipe); `bcp ... in`; `sqlpackage` Publish or Import — also behind `docker exec`, `ssh`, `sudo` or `bash -c` | denies: writes go through `pythia-mssql apply` |
+| an MCP SQL tool given write SQL | denies |
+| reading `connections.json`; editing `policy.json`, the journal or a grant; setting `PYTHIA_MSSQL_CI`; calling `grants.mint` from a one-liner | denies |
+| a `pythia-mssql` read, a preview, `approve --card` | allows without a prompt |
+| `apply --confirm <token>` the developer already approved on this connection | allows; apply re-verifies it |
+| `sqlcmd` reads, `bcp ... queryout`, `approve`, `--yes`, `policy set`, anything compound | stays out: the client asks |
+
+The guard reads a command for what it names, not what it means: it can
+deny a harmless command (a `SELECT` that mentions `sp_help`) and miss a
+write spelled in a way it does not list. It sees the commands Claude Code
+hands its Bash tool, not SSMS or Azure Data Studio. The gate behind it
+holds either way (pythia-core's SECURITY.md).
 
 ## Connections
 
@@ -100,15 +152,102 @@ rest.
 
 ```bash
 pythia-mssql apply change.sql                   # preview: rehearsed, rolled back, nothing written
-pythia-mssql approve 3fa9c1                     # the developer approves, at their own console
+pythia-mssql approve 3fa9c1                     # the developer approves (or from chat, below)
 pythia-mssql apply change.sql --confirm 3fa9c1  # writes it — only as approved
 pythia-mssql journal restore <entry>            # undo is a write too: preview, approve, confirm
 pythia-mssql policy                             # which groups may be written, and is rollback real?
 ```
 
-Until the harness arrives (4c), the developer approves in their own
-terminal: there is no hook to read a chat answer and no MCP approver yet,
-so the preview names no other door.
+The developer approves through the first door that works:
+
+1. **In Claude Code's chat.** The agent asks with AskUserQuestion, its text
+   exactly the output of `pythia-mssql approve --card <token>`, options
+   Approve / Reject. The answer hook records the approval only when the
+   question carried that card and the developer chose Approve themselves —
+   not an answer the agent wrote, not a dialog that closed unattended.
+2. **Through the MCP approver** (`pythia_mssql_approve`; Codex starts
+   here): the client shows the card, and only an explicit Approve counts.
+3. **At the developer's console:** `pythia-mssql approve <token>`.
+
+`pythia-mssql doctor` warns about settings that would answer the chat door
+for the developer (`dontAsk` mode, an allow rule for AskUserQuestion, a hook
+matching every tool).
+
+### A release: `deploy`, one transaction
+
+```bash
+pythia-mssql deploy 01_schema.sql 02_data.sql                     # preview the release as one transaction
+pythia-mssql deploy 01_schema.sql 02_data.sql --confirm 9c41e0b2aa  # all of it, as approved, or none
+```
+
+A release — one or more scripts, cut where SQL Server's tools cut them: at
+`GO` lines, then at each `;`, with a module's body running to the end of
+its batch — is rehearsed in one transaction: each statement in order,
+snapshotted before it runs, its rows and verification taken at its own
+point (an UPDATE of a column the release adds is rehearsed against that
+column), then everything rolls back. One card shows every statement, and
+one approval (a 10-digit token, through the same doors) covers the release;
+a single statement's token cannot be approved alone. The confirm checks
+that every statement is byte-identical to what was approved before anything
+runs, re-runs the release in one transaction, and commits only if every
+statement still matches. A statement that fails, or rows, objects or
+verifications that moved, roll back the whole release. A trigger that
+commits past the rehearsal at statement *n* is reported `WRITTEN?` for
+statements 1 to *n*, with every restore. Refused before anything runs:
+`GO n`, `SET` inside a release, and anything `apply` refuses.
+
+### Lint: before any apply
+
+```bash
+pythia-mssql lint 01_schema.sql 02_code.sql   # a change's files in one run
+pythia-mssql lint --rules                     # every rule and its effective severity
+```
+
+The rules read what SQL Server accepts and a reviewer would not:
+
+| Rule | Default | Why |
+|---|---|---|
+| `mssql-trigger-commit` | error | a trigger's `COMMIT` ends its caller's transaction (error 3609), and commits work the caller may still roll back |
+| `mssql-unsized-string` | error | `varchar`, `nvarchar`, `char`, `binary` without a length hold 1 character in a declaration and 30 in `CAST`, and SQL Server cuts the rest silently |
+| `mssql-nolock` | warn | `NOLOCK` / `READ UNCOMMITTED` can skip a row, read one twice, or read what is rolled back |
+| `mssql-select-star` | warn | `SELECT *` in a view keeps the old column list until `sp_refreshview`; `EXISTS (SELECT * ...)` is fine |
+| `mssql-not-in-subquery` | warn | `NOT IN (SELECT ...)` is never true when the subquery returns a NULL |
+| `mssql-deprecated-type` | warn | `text`, `ntext`, `image` — `varchar(max)`, `nvarchar(max)`, `varbinary(max)` |
+| `mssql-datetime` | info | `datetime` rounds to 1/300 s and `smalldatetime` to the minute — `datetime2` |
+| `mssql-sp-prefix` | warn | a procedure named `sp_` is looked for in master first |
+| `mssql-nocount` | info | a procedure without `SET NOCOUNT ON` sends a row count per statement |
+| `mssql-table-comment` | warn | a new table gets its `MS_Description` in the same change |
+
+What SQL Server rejects itself is left to the rehearsal. The team sets
+severities and naming patterns in `.pythia/mssql/lint.json`:
+
+```json
+{"severity": {"mssql-select-star": "error", "naming": "error"},
+ "naming": {"PROCEDURE": "^p_[a-z0-9_]+$", "VIEW": "^v_[a-z0-9_]+$"}}
+```
+
+Every preview shows the findings, a statement's errors are on its card, and
+autopilot never lands a lint error.
+
+### Autopilot: one lease instead of every approval
+
+```bash
+pythia-mssql autopilot request --groups source,comments --hours 2 --max-writes 30
+pythia-mssql autopilot report      # every write under the lease, with its restore
+pythia-mssql autopilot off         # anyone may revoke
+```
+
+When the developer wants the agent to work without approving each write,
+the agent requests a lease. Its card names the connection, the groups, the
+time, the number of writes and whether destructive statements are included,
+and nothing is delegated until the developer approves it through a door (or
+runs `pythia-mssql autopilot on` at a console). While it lasts, `apply` and
+`deploy` land what it covers without `--confirm` — still snapshotted,
+rehearsed, verified and journaled. It never covers another connection, one
+marked `"protected": true` (or an `"env"` of prod / production / prd /
+live), a group or destructive statement the card did not name, or more than
+1000 rows; a write that breaks something, a write that escaped its
+transaction, or five failures in a row pause it.
 
 ### One statement: `apply`
 
