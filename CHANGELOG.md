@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.0.dev0 — unreleased
+
+Phase 4b of the plan in pythia-core's DESIGN.md: SQL Server's write tier,
+on pythia-core 0.9.0.dev0.
+
+- **`apply`, `approve`, `journal`, `policy`** over pythia-core's gate:
+  snapshot, impact, rehearse, preview, a person's approval, commit, report.
+- **A T-SQL reader:** `'...'` and `N'...'` strings, `[bracketed]` and
+  `"quoted"` names, `--` and nested `/* */` comments, `GO` lines. A module
+  takes its whole batch; anything else ends at its `;`. A second statement
+  on a line of its own is caught even without a `;`.
+- **Classification refuses what no group honestly fits:** `EXEC` of a
+  procedure, control flow, `SELECT`, `WITH`, `MERGE`, `USE`, transaction
+  control, temporary objects, server-level objects, statements that cannot
+  run in a transaction, extended properties other than `MS_Description`
+  (and any given by position), `GO`.
+- **The rehearsal binds the modules around a change** with
+  `sys.dm_sql_referenced_entities` before and after the statement, so an
+  `ALTER TABLE ... DROP COLUMN` names the view it breaks.
+- **A trigger cannot commit a rehearsal.** The statement runs one
+  transaction level down, so a trigger's single `COMMIT` commits nothing. A
+  transaction that ends anyway (`@@TRANCOUNT` 0, or a new transaction id)
+  is reported `escaped` — exit 3, never "nothing was written" — unless the
+  database's triggers show it was rolled back (pymssql reports a trigger's
+  own RAISERROR or THROW, not 3609, so the triggers decide, not the error
+  number).
+- **Rows are revalidated** with `CHECKSUM_AGG(BINARY_CHECKSUM(*))`, and an
+  UPDATE or DELETE whose rows cannot be read beforehand is refused —
+  including a WHERE clause whose parentheses do not balance, which would
+  put a statement of its own into the probe that runs before approval.
+- **`MS_Description` is snapshotted and restored:** updated back, added
+  back, or dropped again. An encrypted module is refused: there is nothing
+  to snapshot.
+- **`tests/live_check.py` writes on a real server:** preview, approve,
+  confirm and restore; a new object undone by a DROP; rows that move; a
+  comment; a DROP COLUMN that breaks a view, a verification that moved,
+  written-but-broken; and triggers that COMMIT once, commit past the
+  rehearsal, roll back, or fire on DDL.
+
 ## 0.1.0.dev0 — unreleased
 
 Phase 4a of the plan in pythia-core's DESIGN.md: SQL Server's connect and

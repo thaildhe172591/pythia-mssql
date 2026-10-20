@@ -8,12 +8,12 @@ PostgreSQL: the agent learns from the live catalog, asks a person before
 any write, and writes only through a gate that snapshots, verifies and
 reports honestly.
 
-**Pre-alpha (Phase 4a).** It reads everything pythia's Learn movement
-needs, and writes nothing yet.
+**Pre-alpha (Phase 4b).** It reads everything pythia's Learn movement
+needs, and writes through one gate.
 
 | Works today | Next |
 |---|---|
-| `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` | the write gate (4b); the harness, deploy, autopilot and lint (4c) |
+| `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections`; `apply`, `approve`, `journal`, `policy` | the harness — guard, `install`, `doctor`, the chat doors and skills — with `deploy`, autopilot and lint (4c) |
 
 ## Install (from git while pre-alpha)
 
@@ -96,16 +96,92 @@ rest.
   back. A read-only login (`db_datareader` plus `VIEW DEFINITION`) is the
   first line.
 
+### Writing: the gate
+
+```bash
+pythia-mssql apply change.sql                   # preview: rehearsed, rolled back, nothing written
+pythia-mssql approve 3fa9c1                     # the developer approves, at their own console
+pythia-mssql apply change.sql --confirm 3fa9c1  # writes it — only as approved
+pythia-mssql journal restore <entry>            # undo is a write too: preview, approve, confirm
+pythia-mssql policy                             # which groups may be written, and is rollback real?
+```
+
+Until the harness arrives (4c), the developer approves in their own
+terminal: there is no hook to read a chat answer and no MCP approver yet,
+so the preview names no other door.
+
+### One statement: `apply`
+
+One statement per file. A module (`CREATE [OR ALTER] PROCEDURE`, `FUNCTION`,
+`VIEW`, `TRIGGER`) takes its whole batch, as SQL Server does; anything else
+ends at its `;`. `apply` sorts the statement into a group, and the policy
+decides: `source` and `comments` (an `MS_Description` through
+`sp_addextendedproperty`, `sp_updateextendedproperty` or
+`sp_dropextendedproperty`, its arguments named) need the developer's
+approval; `data_dml`, `structural` (DDL, `sp_rename`) and `grants` (`GRANT`,
+`REVOKE`, `DENY`, users, roles) are denied until the developer runs
+`pythia-mssql policy set <group> confirm` at a console. `session` (`SET`) is
+allowed.
+
+What the preview shows, and why it can be trusted:
+
+- **A rehearsal, not a prediction.** The statement ran inside a transaction
+  and was rolled back. Every module that depends on what changed — and the
+  module itself — is bound with `sys.dm_sql_referenced_entities` before and
+  after, and what fails only after is what the statement broke: an `ALTER
+  TABLE ... DROP COLUMN` names the view it would break. The diff compares
+  the definition before and after, both as SQL Server keeps them (it keeps
+  `CREATE OR ALTER` as `create`, padded with spaces).
+- **Rows are shown and revalidated.** An UPDATE or DELETE is approved on its
+  rows: the count, a sample, and `CHECKSUM_AGG(BINARY_CHECKSUM(*))` over
+  them. If any row joins, leaves or changes before the confirm, the confirm
+  is refused.
+- **The confirm is the same rehearsal, committed only if it still
+  matches.** Same token (the file, the object as it stood, the rows), same
+  row count, and nothing broken that the approved preview did not show.
+- **A trigger cannot commit the rehearsal.** In SQL Server a trigger's
+  `COMMIT` or `ROLLBACK` ends the caller's transaction. The statement runs
+  one transaction level down, so a trigger's single `COMMIT` ends only that
+  level and commits nothing (the preview says so: run any other way, the
+  statement ends with error 3609). If the transaction ends anyway — a
+  trigger that commits twice, or loops — pythia-mssql reads every trigger
+  in the database: when one could have committed (it says `COMMIT`, runs
+  other code, or cannot be read), or nothing visible explains it, the write
+  is reported **`WRITTEN?`** with exit 3 and the restore, never "nothing was
+  written". Only a trigger that rolls back, with none able to commit, is a
+  plain refusal.
+- **Refused, with the reason:** `EXEC` of a procedure, control flow (`IF`,
+  `WHILE`, `DECLARE`, `BEGIN ... END`), `SELECT`, `WITH`, `MERGE`, `USE`,
+  transaction control, temporary objects, logins and other server-level
+  objects, statements that cannot run in a transaction (`ALTER DATABASE`,
+  `BACKUP`, full-text), extended properties other than `MS_Description`,
+  `GO`, several statements in one file (a second statement on its own line
+  counts, `;` or not), an UPDATE or DELETE whose rows cannot be read
+  beforehand (`TOP`, `OUTPUT`, `FROM` or a join, a subquery, `WHERE CURRENT
+  OF`, parentheses that do not balance), and a module `WITH ENCRYPTION`
+  (nothing to snapshot).
+
+A rehearsal waits at most 5 s for a lock (`SET LOCK_TIMEOUT`); SQL Server
+has no session statement timeout. It still fires triggers and draws
+`IDENTITY` values and sequence numbers, and the preview of a DML statement
+says so. Exit codes follow pythia: `0` clean, `1` refused, `3` written but
+broken (with the restore command).
+
 ### Least privilege
 
 The read commands need `db_datareader` on the database and `VIEW
-DEFINITION` (without it, module definitions read as empty). The live check
-runs every read command as such a login.
+DEFINITION` (without it, module definitions read as empty, and every
+trigger's text is unknown — so a rehearsal that ends its transaction is
+always reported `WRITTEN?`). Writing needs what the statement needs:
+`db_datawriter` for rows, `db_ddladmin` or `ALTER` on the schema for code
+and DDL. The preview warns when the login is `sysadmin` or `db_owner`. The
+live check runs every read command as a read-only login, and every write
+as one with `db_datawriter` and `db_ddladmin`.
 
 ## Tests
 
 ```bash
-python tests/test_mssql.py    # no database, no pymssql
+python tests/test_mssql.py    # no database, no pymssql — mutation-checked
 python tests/live_check.py    # a disposable server only (see its docstring)
 ```
 

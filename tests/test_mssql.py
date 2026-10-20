@@ -460,6 +460,469 @@ def test_a_table_is_rebuilt_column_by_column_in_batches():
     assert "@value = N'Orders, ''all'''" in ddl and ddl.endswith("select 1\nGO")
 
 
+
+# --- the write tier: reading T-SQL, without a database -----------------------------
+
+from pythia_mssql import write  # noqa: E402
+
+
+def test_the_reader_knows_t_sql_quoting():
+    text = ("create procedure p as\n"
+            "begin\n  select 'a;b', N'it''s; ok', [semi;colon], \"q;uoted\" -- not a cut ;\n"
+            "end; /* outer /* nested ; */ still comment ; */\n"
+            "select 2;")
+    lexed = write.lex(text)
+    assert not lexed.unterminated
+    masked = lexed.masked
+    assert len(masked) == len(text)
+    for hidden in ("a;b", "it", "semi", "uoted", "not a cut", "nested", "still"):
+        assert hidden not in masked, hidden
+    assert write.lex("select 'open").unterminated
+    assert write.lex("select [open").unterminated
+    assert write.lex("/* open /* nested */").unterminated
+    assert write.lex("select N'x' + n'y'").masked.count("'") == 4    # quotes stay, contents go
+
+
+def test_a_script_splits_at_go_and_a_module_takes_its_whole_batch():
+    script = ("-- release 7\n"
+              "create or alter procedure app_owner.p_one as\n"
+              "begin\n  update t set x = 1; -- inside the body\n  select 1;\nend\n"
+              "GO\n"
+              "alter table t add note nvarchar(40);\n"
+              "update t set note = N'go; here' where id = 1;\n"
+              "go 1\n"
+              "  GO  \n"
+              "exec sys.sp_addextendedproperty @name = N'MS_Description', @value = N'GO',\n"
+              "  @level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE', @level1name = N't'\n"
+              "GO\n")
+    got = write.split_script(script)
+    assert [line for line, _ in got] == [2, 8, 9, 12], got
+    assert got[0][1].startswith("-- release 7\ncreate or alter procedure") and got[0][1].endswith("end")
+    assert got[2][1] == "update t set note = N'go; here' where id = 1"
+    assert [write.classify(t)[0] for _, t in got] == ["source", "structural", "data_dml", "comments"]
+    assert write.split_script("-- only a comment\nGO\n") == []
+    assert write.split_script("select 'GO\nGO'") == [(1, "select 'GO\nGO'")]   # GO in a string
+
+
+def classified(text):
+    return write.classify(text)[0]
+
+
+def refusal(text):
+    group, why = write.classify(text)
+    assert group is None, (text, group)
+    return why
+
+
+def test_classify_sorts_every_statement_or_says_why_not():
+    assert classified("CREATE PROCEDURE app_owner.p AS SELECT 1") == "source"
+    assert classified("create or alter function dbo.f() returns int as begin return 1 end") == "source"
+    assert classified("-- header\nALTER VIEW v AS SELECT 1 AS x") == "source"
+    assert classified("create trigger trg on t after insert as select 1") == "source"
+    assert classified("create proc p as select 1") == "source"
+    assert classified("exec sys.sp_addextendedproperty @name = N'MS_Description', @value = N'x', "
+                      "@level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', "
+                      "@level1name = N't'") == "comments"
+    assert classified("EXECUTE sp_updateextendedproperty @name = N'MS_Description', @value = N'y', "
+                      "@level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', "
+                      "@level1name = N't'") == "comments"
+    assert classified("exec sp_rename 'dbo.t.old', 'new', 'COLUMN'") == "structural"
+    assert classified("UPDATE t_order SET status = 'PAID' WHERE id = 1") == "data_dml"
+    assert classified("insert into t_order (id) values (1)") == "data_dml"
+    assert classified("alter table t_order add note nvarchar(40)") == "structural"
+    assert classified("create table t (id int)") == "structural"
+    assert classified("drop procedure p") == "structural"
+    assert classified("truncate table t_order") == "structural"
+    assert classified("create index ix on t (id)") == "structural"
+    assert classified("grant select on t_order to app_ro") == "grants"
+    assert classified("deny delete on t_order to app_ro") == "grants"
+    assert classified("alter role db_datareader add member app_ro") == "grants"
+    assert classified("create user app_ro for login app_ro") == "grants"
+    assert classified("set ansi_warnings on") == "session"
+    assert "owns the transaction" in refusal("begin tran")
+    assert "owns the transaction" in refusal("commit transaction")
+    assert "owns the transaction" in refusal("set transaction isolation level serializable")
+    assert "control flow" in refusal("if 1 = 1 delete from t")
+    assert "control flow" in refusal("declare @x int = 1")
+    assert "control flow" in refusal("begin delete from t; end")
+    assert "procedure's body" in refusal("exec dbo.p_settle")
+    assert "MS_Description" in refusal(
+        "exec sp_addextendedproperty @name = N'Owner', @value = N'x', @level0type = N'SCHEMA', "
+        "@level0name = N'dbo', @level1type = N'TABLE', @level1name = N't'")
+    assert "named" in refusal("exec sp_addextendedproperty N'MS_Description', N'x', N'SCHEMA', N'dbo'")
+    assert "database" in refusal("use other_db")
+    assert "reads" in refusal("select * from t")
+    assert "WITH" in refusal("with x as (select 1 as a) delete from t")
+    assert "inside a transaction" in refusal("alter database app set recovery simple")
+    assert "inside a transaction" in refusal("backup database app to disk = 'x'")
+    assert "inside a transaction" in refusal("create fulltext index on t (c) key index pk")
+    assert "server" in refusal("create login l with password = 'x'")
+    assert "temporary" in refusal("create table #t (x int)")
+    assert "one statement per file" in refusal("insert into t values (1); insert into t values (2);")
+    assert "one statement per file" in refusal("insert into t values (1)\ndelete from t where id = 2")
+    assert "one statement per file" in refusal("alter table t add c int\ndrop table u")
+    assert classified("alter table t add c int,\n  d int") == "structural"
+    assert classified("alter table t\n  drop column c") == "structural"
+    assert classified("alter table t\n  alter column c bigint") == "structural"
+    assert classified("update t\nset x = 1\nwhere id in (select id from u)") == "data_dml"
+    assert classified("insert into t (id)\nselect id from u") == "data_dml"
+    assert "GO" in refusal("create procedure p as select 1\nGO\nselect 2")
+    assert "ends inside" in refusal("create procedure p as select 'open")
+    assert "no statement" in refusal("-- only a comment\n")
+    assert "Cannot classify" in refusal("dbcc checkdb")
+
+
+def test_parse_object_reads_the_name_as_sql_server_would():
+    p = write.parse_object
+    assert p("CREATE OR ALTER PROCEDURE [App_Owner].[P_Total] @x int AS SELECT 1", "source") == \
+        {"type": "PROCEDURE", "name": "P_Total", "schema": "App_Owner"}
+    assert p("create proc p_a as select 1", "source") == \
+        {"type": "PROCEDURE", "name": "p_a", "schema": None}
+    assert p('alter view "v x" as select 1', "source")["name"] == "v x"
+    assert p("create trigger app_owner.trg on app_owner.t after update as select 1",
+             "source") == {"type": "TRIGGER", "name": "trg", "schema": "app_owner"}
+    assert p("create function dbo.f() returns int as begin return 1 end", "source")["type"] == "FUNCTION"
+    col = p("exec sys.sp_updateextendedproperty @name = N'MS_Description', @value = N'it''s', "
+            "@level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE', "
+            "@level1name = N't_order', @level2type = N'COLUMN', @level2name = N'status'", "comments")
+    assert col == {"type": "COMMENT", "name": "t_order.status", "schema": "app_owner",
+                   "table": "t_order", "column": "status", "kind": "TABLE",
+                   "value": "it's", "verb": "update"}
+    tab = p("exec sp_addextendedproperty @name = N'MS_Description', @value = N'x', "
+            "@level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'VIEW', "
+            "@level1name = N'v_x'", "comments")
+    assert (tab["name"], tab["kind"], tab["column"], tab["verb"]) == ("v_x", "VIEW", None, "add")
+    assert p("delete from t_order where id = 1", "data_dml") is None
+
+
+def test_dml_probe_finds_the_rows_or_refuses_to_guess():
+    probe = write.dml_probe
+    assert probe("update [app_owner].[t_order] set status = 'PAID' where id < 3") == \
+        ("[app_owner].[t_order]", "id < 3")
+    assert probe("delete from app_owner.t_order where status = 'x;y'") == \
+        ("app_owner.t_order", "status = 'x;y'")
+    assert probe("delete t_order") == ("t_order", None)
+    assert probe("delete from t_order -- all?\n where id = 1 -- one") == ("t_order", "id = 1")
+    assert probe("insert into t_order (id) values (1)") is None
+    for stmt, why in (
+            ("merge t using s on t.id = s.id when matched then delete;", "MERGE"),
+            ("update t set x = s.x from s where t.id = s.id", "FROM"),
+            ("delete t from t join s on s.id = t.id", "FROM"),
+            ("update top (10) t set x = 1", "TOP"),
+            ("delete from t output deleted.id where id = 1", "OUTPUT"),
+            ("delete from t where id in (select id from s)", "subquery"),
+            ("update t set x = 1 where current of c", "CURRENT OF"),
+            # the probe runs `where (<predicate>)` before approval: a predicate
+            # that closes the parenthesis would add a statement of its own
+            ("delete from t where id = 1) update x set v = 1 where (1 = 1", "parentheses"),
+            ("delete from t where (id = 1", "parentheses")):
+        try:
+            probe(stmt)
+        except SystemExit as e:
+            assert why in str(e), (stmt, str(e))
+        else:
+            raise AssertionError(f"probe guessed at: {stmt}")
+
+
+class TextConn:
+    """Answers the text pythia runs with no binds: the row-set probes."""
+
+    def __init__(self, count=2, fingerprint=-5, sample=((1, "DRAFT"), (2, "DRAFT")), fail=None):
+        self.count, self.fingerprint, self.sample, self.fail = count, fingerprint, sample, fail
+        self.ran = []
+
+    def cursor(self):
+        conn = self
+
+        class Cursor(CatalogCursor):
+            def execute(self, sql, params=None):
+                assert params is None, "statement text runs with no binds"
+                conn.ran.append(sql)
+                self.rowcount = -1
+                if conn.fail:
+                    raise DriverError(208, b"Invalid object name 't_nope'.DB-Lib error")
+                if "checksum_agg" in sql:
+                    self.description, self._rows = [("ROW_COUNT",), ("FINGERPRINT",)], [
+                        (conn.count, conn.fingerprint)]
+                else:
+                    self.description, self._rows = [("id",), ("status",)], list(conn.sample)
+        return Cursor(conn)
+
+
+def test_the_row_set_is_measured_or_refused():
+    conn = TextConn()
+    got = write.measure_row_set(conn, "[app_owner].[t_order]", "status = '50%'")
+    assert (got["count"], got["hash"], got["columns"]) == (2, "-5", ["ID", "STATUS"])
+    assert got["sample"] == [["1", "DRAFT"], ["2", "DRAFT"]] and got["truncated"] is False
+    assert all("from [app_owner].[t_order] where (status = '50%')" in sql for sql in conn.ran)
+    got = write.measure_row_set(TextConn(sample=[(i, "x") for i in range(11)]), "t", None)
+    assert len(got["sample"]) == 10 and got["truncated"] is True and got["predicate"] == ""
+    expect_exit(lambda: write.measure_row_set(TextConn(fail=True), "t_nope", "id = 1"),
+                "could not measure", "Invalid object name 't_nope'", "Revalidation is mandatory")
+
+
+def test_a_snapshot_is_the_definition_or_a_refusal():
+    proc = {"type": "PROCEDURE", "name": "p_total", "schema": None}
+    head = ("objid", "definition")
+    conn = CatalogConn({"module-definition.sql": (head, [(7, "create procedure p_total as select 1")])})
+    assert write.snapshot(conn, "app_owner", "source", proc) == {
+        "p_total": "create procedure p_total as select 1"}
+    assert conn.asked == [("module-definition.sql", {"q": "[app_owner].[p_total]"})]
+    conn = CatalogConn({"module-definition.sql": (head, [(None, None)])})
+    assert write.snapshot(conn, "app_owner", "source", proc) == {}          # a new object
+    conn = CatalogConn({"module-definition.sql": (head, [(7, None)])})
+    expect_exit(lambda: write.snapshot(conn, "app_owner", "source", proc),
+                "WITH ENCRYPTION", "nothing to snapshot")
+    col = {"type": "COMMENT", "name": "t_order.status", "schema": "app_owner",
+           "table": "t_order", "column": "status"}
+    conn = CatalogConn({"comment-current.sql": (("comment",), [("DRAFT until paid",)])})
+    assert write.snapshot(conn, "app_owner", "comments", col) == {"t_order.status": "DRAFT until paid"}
+    assert conn.asked == [("comment-current.sql", {"s": "app_owner", "t": "t_order", "c": "status"})]
+    conn = CatalogConn({"comment-current.sql": (("comment",), [])})
+    assert write.snapshot(conn, "app_owner", "comments", col) == {}
+    assert write.snapshot(conn, "app_owner", "data_dml", None) == {}
+
+
+def test_a_login_that_can_do_far_more_is_named():
+    def power(sysadmin, owner):
+        conn = CatalogConn({"session-power.sql": (("is_sysadmin", "is_db_owner", "login_name"),
+                                                   [(sysadmin, owner, "app_deploy")])})
+        return write.privilege_warning(conn, "app_owner")
+    assert "sysadmin" in power(1, 1) and "app_deploy" in power(1, 1)
+    assert "db_owner" in power(0, 1)
+    assert power(0, 0) is None
+
+
+def test_destruction_is_named():
+    d = write.destructive_reason
+    assert d("drop table t_order", "structural").startswith("DROP removes")
+    assert "TRUNCATE" in d("truncate table t_order", "structural")
+    assert "column or constraint" in d("alter table t drop column x", "structural")
+    assert "type" in d("alter table t alter column x bigint", "structural")
+    assert "sp_rename" in d("exec sp_rename 'dbo.t', 't2'", "structural")
+    assert "every row" in d("delete from t_order", "data_dml")
+    assert "every row" in d("update t_order set x = 1", "data_dml")
+    assert "always true" in d("update t set x = 1 where 1 = 1", "data_dml")
+    assert d("delete from t where id = 1", "data_dml") is None
+    assert "REVOKE" in d("revoke select on t from app_ro", "grants")
+    assert "DENY" in d("deny select on t to app_ro", "grants")
+    assert "public" in d("grant select on t to public", "grants")
+    assert d("exec sp_addextendedproperty @name = N'MS_Description', @value = N'drop table x'",
+             "comments") is None
+
+
+def test_restore_puts_back_or_drops():
+    r = write.restore_statement
+    proc = {"type": "PROCEDURE", "name": "p_total", "schema": None}
+    assert r("source", proc, "-- head\nCREATE PROCEDURE app_owner.p_total AS\nSELECT 1", {}) == \
+        "-- head\nCREATE OR ALTER PROCEDURE app_owner.p_total AS\nSELECT 1"
+    assert r("source", proc, "create or alter procedure p as select 1", {}) == \
+        "create or alter procedure p as select 1"
+    assert r("source", proc, "", {"drop": "[app_owner].[p_total]"}) == \
+        "DROP PROCEDURE [app_owner].[p_total]"
+    view = {"type": "VIEW", "name": "v_x", "schema": None}
+    assert r("source", view, "", {"drop": "[app_owner].[v_x]"}) == "DROP VIEW [app_owner].[v_x]"
+    com = {"type": "COMMENT", "name": "t_order.status", "schema": "app_owner",
+           "table": "t_order", "column": "status", "kind": "TABLE"}
+    assert r("comments", com, "it's", {"schema": "app_owner"}) == (
+        "EXEC sys.sp_updateextendedproperty @name = N'MS_Description', @value = N'it''s', "
+        "@level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE', "
+        "@level1name = N't_order', @level2type = N'COLUMN', @level2name = N'status'")
+    assert r("comments", com, "", {"schema": "app_owner"}).startswith(
+        "EXEC sys.sp_dropextendedproperty @name = N'MS_Description', @level0type")
+    assert write.classify(r("comments", com, "", {"schema": "app_owner"}))[0] == "comments"
+    assert r("comments", com, "x", {"schema": "app_owner", "exists_after": False}).startswith(
+        "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'x'")
+
+
+def test_the_changed_object_is_read_from_the_statement():
+    c = write.changed_object
+    assert c("alter table [App_Owner].[T_Order] drop column note", "structural", None,
+             "app_owner") == ("App_Owner", "T_Order")
+    assert c("drop table if exists t_old", "structural", None, "app_owner") == ("app_owner", "t_old")
+    assert c("drop view reporting.v_paid", "structural", None, "app_owner") == ("reporting", "v_paid")
+    assert c("create unique nonclustered index ix on app_owner.t_order (status)", "structural",
+             None, "dbo") == ("app_owner", "t_order")
+    assert c("truncate table t_order", "structural", None, "app_owner") == ("app_owner", "t_order")
+    assert c("exec sp_rename 'app_owner.t_order.note', 'remark', 'COLUMN'", "structural",
+             None, "dbo") == ("app_owner", "t_order")
+    assert c("exec sp_rename N't_order', 't_orders'", "structural", None, "app_owner") == \
+        ("app_owner", "t_order")
+    assert c("create table t (id int)", "structural", None, "app_owner") is None
+    proc = {"type": "PROCEDURE", "name": "p_a", "schema": None}
+    assert c("create proc p_a as select 1", "source", proc, "app_owner") == ("app_owner", "p_a")
+
+
+class TxnConn:
+    """A session with SQL Server's nested transactions, as the driver spike
+    measured them: @@TRANCOUNT, the transaction's id, and a trigger whose
+    COMMIT ends one level (committing only at the outermost) and whose
+    ROLLBACK ends them all. Error 3609 when it leaves @@TRANCOUNT at 0."""
+
+    def __init__(self, trigger=(), triggers=(), fail=None, ids=True):
+        self.count, self.txn = 1, 100 if ids else None
+        self.ids = iter(range(101, 200)) if ids else iter(lambda: None, 0)
+        self.trigger, self.triggers, self.fail = list(trigger), list(triggers), fail
+        self.committed, self.ran = False, []
+
+    def cursor(self):
+        return TxnCursor(self)
+
+    def statement(self, sql):
+        self.ran.append("STATEMENT")
+        for action in self.trigger:
+            if action == "commit":
+                self.count -= 1
+                if self.count == 0:
+                    self.committed, self.txn = True, next(self.ids)
+            elif action == "rollback":
+                self.count, self.txn = 0, next(self.ids)
+            elif action == "begin":
+                if self.count == 0:
+                    self.txn = next(self.ids)
+                self.count += 1
+        if self.fail:
+            if self.fail[0] == 1205:          # a deadlock victim: SQL Server rolls back
+                self.count, self.txn = 0, next(self.ids)
+            raise DriverError(*self.fail)     # a trigger's own error comes first
+        if self.count == 0:
+            raise DriverError(3609, b"The transaction ended in the trigger. The batch "
+                              b"has been aborted.DB-Lib error message 20018, severity 16")
+        return 2
+
+
+class TxnCursor(CatalogCursor):
+    def execute(self, sql, params=None):
+        self.description, self._rows, self.rowcount = None, [], -1
+        name = QUERY_TEXT.get(sql)
+        if name is None:
+            self.rowcount = self.conn.statement(sql)
+            return
+        self.conn.ran.append(name)
+        if name == "rehearsal-begin.sql":
+            self.conn.count += 1
+        elif name == "rehearsal-level-up.sql":
+            self.conn.count = min(self.conn.count, 1)
+        elif name == "transaction-state.sql":
+            self.description, self._rows = [("TRANCOUNT",), ("TXN",)], [
+                (self.conn.count, self.conn.txn)]
+        elif name == "triggers-enabled.sql":
+            self.description = [("SCHEMA_NAME",), ("TRIGGER_NAME",), ("DEFINITION",)]
+            self._rows = self.conn.triggers
+
+
+DML = "update app_owner.t_order set status = 'PAID' where id = 1"
+AUDIT = ("app_owner", "trg_order_audit",
+         "create trigger trg_order_audit on t_order after update as insert t_order_audit "
+         "select id from inserted -- never commit here")
+
+
+def rehearse_dml(conn):
+    return write.rehearse(conn, "app_owner", "data_dml", DML, None, {}, DriverError)
+
+
+def test_a_rehearsal_runs_one_level_down_and_comes_back_up():
+    conn = TxnConn(triggers=[AUDIT])
+    out = rehearse_dml(conn)
+    assert out["error"] is None and "escaped" not in out and out["rows"] == 2
+    assert conn.ran.index("rehearsal-begin.sql") < conn.ran.index("STATEMENT") \
+        < conn.ran.index("rehearsal-level-up.sql")
+    assert conn.count == 1 and not conn.committed           # core's level, still open
+    conn = TxnConn(fail=(547, b"The UPDATE statement conflicted with the CHECK constraint"))
+    out = rehearse_dml(conn)
+    assert out["error"].startswith("547: The UPDATE statement conflicted")
+    assert "escaped" not in out and "triggers-enabled.sql" not in conn.ran
+
+
+def test_a_trigger_that_commits_once_commits_nothing():
+    conn = TxnConn(trigger=["commit"], triggers=[AUDIT])
+    out = rehearse_dml(conn)
+    assert out["error"] is None and "escaped" not in out
+    assert not conn.committed and conn.count == 1
+    assert any("3609" in n and "COMMIT" in n for n in out["notes"]), out["notes"]
+    conn = TxnConn(trigger=["commit", "begin"])
+    assert "escaped" not in rehearse_dml(conn) and not conn.committed
+
+
+def test_a_trigger_that_commits_past_the_rehearsal_is_reported_escaped():
+    committer = ("app_owner", "trg_settle",
+                 "create trigger trg_settle on t_order after update as "
+                 "while @@trancount > 0 commit")
+    for trigger in (["commit", "commit"], ["commit", "commit", "begin"]):
+        conn = TxnConn(trigger=trigger, triggers=[AUDIT, committer])
+        out = rehearse_dml(conn)
+        assert conn.committed, trigger
+        assert out.get("escaped") and "trg_settle" in out["escaped"], (trigger, out)
+        assert "trg_order_audit" not in out["escaped"]       # its COMMIT is a comment
+    out = rehearse_dml(TxnConn(trigger=["commit", "commit"]))
+    assert out.get("escaped")                                  # a commit nobody can name
+    out = rehearse_dml(TxnConn(trigger=["commit", "commit"], triggers=[committer], ids=False))
+    assert out.get("escaped"), out          # the depth alone tells, with no transaction id
+
+
+def test_a_trigger_that_rolls_back_wrote_nothing_unless_one_could_commit():
+    guard = ("app_owner", "trg_guard", "create trigger trg_guard on t_order after update "
+             "as if exists (select 1 from inserted where total < 0) rollback")
+    out = rehearse_dml(TxnConn(trigger=["rollback"], triggers=[AUDIT, guard]))
+    assert "escaped" not in out
+    assert "3609" in out["error"] and "rolled the statement back" in out["error"]
+    assert "nothing was written" in out["error"]
+    for doubt, needle in (
+            (("app_owner", "trg_x", None), "trg_x (its text cannot be read)"),
+            (("app_owner", "trg_y", "create trigger trg_y on t after update as "
+              "exec app_owner.p_audit"), "trg_y"),
+            (("", "ddl_watch", "create trigger ddl_watch on database for create_table "
+              "as exec sp_executesql N'commit'"), "ddl_watch")):
+        out = rehearse_dml(TxnConn(trigger=["rollback"], triggers=[guard, doubt]))
+        assert out.get("escaped") and needle in out["escaped"], (doubt, out)
+    out = rehearse_dml(TxnConn(fail=(1205, b"Transaction was deadlocked"), triggers=[AUDIT]))
+    assert "escaped" not in out and "rolled the deadlock victim's" in out["error"]
+    out = rehearse_dml(TxnConn(trigger=["rollback"], triggers=[AUDIT],
+                               fail=(50000, b"v too large")))
+    assert "explains it" in out.get("escaped", ""), out       # a THROW after a COMMIT?
+    out = rehearse_dml(TxnConn(trigger=["rollback"], triggers=[guard],
+                               fail=(50000, b"total below zero")))
+    assert "escaped" not in out and out["error"].startswith("50000: total below zero")
+    out = rehearse_dml(TxnConn(trigger=["rollback"], triggers=[AUDIT]))
+    assert "explains it" in out.get("escaped", ""), out       # no visible trigger rolls back
+    conn = TxnConn(trigger=["rollback"], triggers=[guard])
+    conn.cursor = lambda: (_ for _ in ()).throw(DriverError(10054, b"connection reset")) \
+        if conn.ran.count("STATEMENT") else TxnCursor(conn)
+    assert rehearse_dml(conn).get("escaped")                    # a dead session: cannot tell
+
+
+def test_an_escaped_outcome_still_says_how_to_restore():
+    ident = write.parse_object(
+        "exec sys.sp_updateextendedproperty @name = N'MS_Description', @value = N'x', "
+        "@level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE', "
+        "@level1name = N't_order'", "comments")
+    stmt = ("exec sys.sp_updateextendedproperty @name = N'MS_Description', @value = N'x', "
+            "@level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE', "
+            "@level1name = N't_order'")
+    conn = TxnConn(trigger=["commit", "commit"])
+    out = write.rehearse(conn, "app_owner", "comments", stmt, ident, {"t_order": "old"},
+                         DriverError)
+    assert out.get("escaped")
+    assert write.restore_statement("comments", ident, "old", out).startswith(
+        "EXEC sys.sp_updateextendedproperty @name = N'MS_Description', @value = N'old'")
+    stmt = ("exec sys.sp_dropextendedproperty @name = N'MS_Description', "
+            "@level0type = N'SCHEMA', @level0name = N'app_owner', @level1type = N'TABLE', "
+            "@level1name = N't_order'")
+    ident = write.parse_object(stmt, "comments")
+    out = write.rehearse(TxnConn(trigger=["commit", "commit"]), "app_owner", "comments",
+                         stmt, ident, {"t_order": "old"}, DriverError)
+    assert write.restore_statement("comments", ident, "old", out).startswith(
+        "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'old'")
+
+
+def test_the_engine_answers_the_write_tier():
+    assert engine_problems(SqlServerEngine(), tiers=("connect", "read", "write")) == []
+    from pythia_core import policy
+    notes = SqlServerEngine.rollback_notes
+    assert set(notes) == set(policy.GROUPS) and all(notes.values()), notes
+    assert notes["data_dml"].startswith("No") and notes["source"].startswith("Yes")
+
+
 def main():
     failed = 0
     for name, fn in sorted(globals().items()):

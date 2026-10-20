@@ -35,6 +35,16 @@ QUERY_BINDS = {
     "modules.sql": {"s", "n"},
     "referenced-check.sql": {"q"},
     "unresolved.sql": {"q"},
+    "rehearsal-settings.sql": set(),
+    "transaction-state.sql": set(),
+    "rehearsal-begin.sql": set(),
+    "rehearsal-level-up.sql": set(),
+    "triggers-enabled.sql": set(),
+    "module-definition.sql": {"q"},
+    "comment-current.sql": {"s", "t", "c"},
+    "session-power.sql": set(),
+    "row-set-count.sql": set(),
+    "row-set-sample.sql": set(),
 }
 
 

@@ -7,6 +7,12 @@
    login pythia_agent is made (db_datareader, VIEW DEFINITION, default
    schema app_owner), and every read command runs through the command line
    as that login.
+3. Then the fixture is loaded again, the login may write (db_datawriter,
+   db_ddladmin), and every write path runs through the gate: preview,
+   approve, confirm and restore; a new object undone by a DROP; rows that
+   move; a comment; a DROP COLUMN that breaks a view, a verification that
+   moved, written-but-broken; and triggers that COMMIT or ROLLBACK inside
+   the rehearsal.
 
 Never point this at a shared server: it creates a login and drops a
 database. Skipped unless PYTHIA_MSSQL_LIVE_HOST is set:
@@ -76,16 +82,18 @@ def scalar(entry, sql, database=DB):
     with admin(entry, database) as conn:
         cur = conn.cursor()
         cur.execute(sql)
-        return cur.fetchone()[0]
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 class Project:
-    """A project folder whose connection is the agent login."""
+    """A project folder whose connection is the agent login: the journal and
+    the grants outlive a single command."""
 
     def __init__(self, entry):
         self.td = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.td.name)
-        state = self.root / ".pythia" / "mssql"
+        self.state = state = self.root / ".pythia" / "mssql"
         state.mkdir(parents=True)
         path = state / "connections.json"
         path.write_text(json.dumps({"live": entry}), encoding="utf-8")
@@ -112,6 +120,33 @@ class Project:
         code, out, why = self.run(*argv, "--json")
         assert code == 0, (argv, why, out)
         return json.loads(out.strip().splitlines()[-1])
+
+    def file(self, name, text):
+        (self.root / name).write_text(text, encoding="utf-8")
+        return name
+
+    def preview(self, name, text):
+        return self.json("apply", self.file(name, text))
+
+    def approve(self, token):
+        """The developer's own act, at their own console."""
+        from pythia_core import human
+        human.FORCE_CONSOLE = True
+        try:
+            code, _, why = self.run("approve", token)
+            assert code == 0, why
+        finally:
+            human.FORCE_CONSOLE = False
+
+    def confirm(self, *argv):
+        """(exit code, the last JSON line or None, the refusal)"""
+        code, out, why = self.run(*argv, "--json")
+        lines = out.strip().splitlines()
+        return code, (json.loads(lines[-1]) if lines and lines[-1].startswith("{")
+                      else None), why
+
+    def policy(self, **groups):
+        (self.state / "policy.json").write_text(json.dumps(groups), encoding="utf-8")
 
 
 def check_connect(entry):
@@ -225,6 +260,201 @@ def ddl_round_trip(entry, p):
     ok("ddl round trip: drop, run the rebuilt DDL, rebuild — identical")
 
 
+def definition(entry, name):
+    return scalar(entry, f"select object_definition(object_id('{name}'))")
+
+
+def comment(entry, column):
+    return scalar(entry, "select cast(value as nvarchar(4000)) from sys.extended_properties "
+                         "where major_id = object_id('app_owner.t_order') and name = "
+                         f"'MS_Description' and minor_id = columnproperty(major_id, "
+                         f"'{column}', 'ColumnId')")
+
+
+CENTS = """create or alter function app_owner.f_order_total(@id bigint) returns numeric(12,2) as
+begin
+    -- the total of one order, in cents
+    return (select total * 100 from app_owner.t_order where id = @id);
+end
+"""
+
+
+def check_writes(entry):
+    from pythia_core import human
+    human.FORCE_CONSOLE = False             # no person here unless one approves
+    agent = load_fixture(entry)
+    run_batches(entry, DB, f"alter role db_datawriter add member [{AGENT}];\nGO\n"
+                           f"alter role db_ddladmin add member [{AGENT}];")
+    p = Project(agent)
+    try:
+        _source(entry, p)
+        _rows_and_comments(entry, p)
+        _breakage(entry, p)
+        _triggers(entry, p)
+    finally:
+        human.FORCE_CONSOLE = None
+
+
+def _source(entry, p):
+    original = definition(entry, "app_owner.f_order_total")
+    doc = p.preview("cents.sql", CENTS)
+    assert doc["created"] is False and doc["rehearsal"]["verified"] is True, doc
+    assert doc["rehearsal"]["broken"] == [] and doc["changed_lines"] > 0, doc
+    assert definition(entry, "app_owner.f_order_total") == original
+    ok("apply: a module previewed — rehearsed, verified, rolled back")
+    token = doc["token"]
+    code, _, why = p.confirm("apply", "cents.sql", "--confirm", token)
+    assert code == 1 and "no developer approval" in why.lower(), why
+    p.approve(token)
+    code, res, why = p.confirm("apply", "cents.sql", "--confirm", token)
+    assert code == 0 and res["applied"] is True, (code, why, res)
+    assert "in cents" in definition(entry, "app_owner.f_order_total")
+    code, _, why = p.confirm("apply", "cents.sql", "--confirm", token)
+    assert code == 1, why
+    ok("approved and confirmed: written once; the token does not write twice")
+    eid = res["restore"].split()[-1]
+    doc = p.json("journal", "restore", eid)
+    p.approve(doc["token"])
+    code, res, why = p.confirm("journal", "restore", eid, "--confirm", doc["token"])
+    assert code == 0, (code, why, res)
+    # SQL Server keeps CREATE OR ALTER as "create   function": the words differ
+    # only in the spaces where OR ALTER stood
+    assert definition(entry, "app_owner.f_order_total").split() == original.split()
+    ok("journal restore: previewed, approved, written — the original is back")
+
+    p.policy(structural="confirm")
+    doc = p.preview("new.sql", "create procedure app_owner.p_new as select 1 as one")
+    assert doc["created"] is True, doc
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "new.sql", "--confirm", doc["token"])
+    assert code == 0 and res["restore_is_drop"] is True, (why, res)
+    eid = res["restore"].split()[-1]
+    doc = p.json("journal", "restore", eid)
+    p.approve(doc["token"])
+    assert p.confirm("journal", "restore", eid, "--confirm", doc["token"])[0] == 0
+    assert scalar(entry, "select object_id('app_owner.p_new')") is None
+    ok("a new object: its undo is a DROP, and says so")
+
+    code, _, why = p.run("apply", p.file("bad.sql", "create or alter procedure "
+                                         "app_owner.p_bad as selec 1"))
+    assert code == 1 and "Rehearsal failed" in why and "nothing was written" in why.lower(), why
+    ok("a statement that fails in rehearsal has nothing to approve")
+    code, out, why = p.run("apply", p.file("session.sql", "set ansi_warnings on"))
+    assert code == 0 and "Session setting applied" in out, (why, out)
+    ok("a session setting says it ends with the connection")
+
+
+def _rows_and_comments(entry, p):
+    p.policy(data_dml="confirm", structural="confirm")
+    audit = scalar(entry, "select count(*) from app_owner.t_order_audit")
+    paid = "update app_owner.t_order set total = total + 1 where status = 'DRAFT'"
+    doc = p.preview("paid.sql", paid)
+    assert doc["row_set"]["count"] == 2 and doc["rehearsal"]["rows"] == 2, doc
+    assert any("triggers" in n for n in doc["rehearsal"]["notes"]), doc
+    p.approve(doc["token"])
+    run_batches(entry, DB, "insert into app_owner.t_order (status, total) values ('DRAFT', 5)")
+    code, _, why = p.confirm("apply", "paid.sql", "--confirm", doc["token"])
+    assert code == 1 and "2 rows" in why and "3" in why, why
+    doc = p.preview("paid.sql", paid)
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "paid.sql", "--confirm", doc["token"])
+    assert code == 0 and res["rows"] == 3, (why, res)
+    assert scalar(entry, "select sum(total) from app_owner.t_order where status = 'DRAFT'") == 38
+    assert scalar(entry, "select count(*) from app_owner.t_order_audit") == audit + 3
+    ok("DML: approved on its rows; rows that moved are refused, then written")
+
+    stmt = ("exec sys.sp_updateextendedproperty @name = N'MS_Description', "
+            "@value = N'Set when it''s paid', @level0type = N'SCHEMA', "
+            "@level0name = N'app_owner', @level1type = N'TABLE', @level1name = N't_order', "
+            "@level2type = N'COLUMN', @level2name = N'status'")
+    doc = p.preview("comment.sql", stmt)
+    assert doc["object"] == "t_order.status" and doc["type"] == "COMMENT", doc
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "comment.sql", "--confirm", doc["token"])
+    assert code == 0 and comment(entry, "status") == "Set when it's paid", (why, res)
+    eid = res["restore"].split()[-1]
+    doc = p.json("journal", "restore", eid)
+    p.approve(doc["token"])
+    assert p.confirm("journal", "restore", eid, "--confirm", doc["token"])[0] == 0
+    assert comment(entry, "status") == "DRAFT until paid"
+    add = stmt.replace("sp_updateextendedproperty", "sp_addextendedproperty") \
+        .replace("N'status'", "N'total'")
+    doc = p.preview("comment.sql", add)
+    p.approve(doc["token"])
+    code, res, _ = p.confirm("apply", "comment.sql", "--confirm", doc["token"])
+    eid = res["restore"].split()[-1]
+    doc = p.json("journal", "restore", eid)
+    p.approve(doc["token"])
+    assert p.confirm("journal", "restore", eid, "--confirm", doc["token"])[0] == 0
+    assert comment(entry, "total") is None
+    ok("comments: MS_Description written and restored — updated, or dropped again")
+
+
+def _breakage(entry, p):
+    run_batches(entry, DB, "alter table app_owner.t_order add note nvarchar(40) null;\nGO\n"
+                           "create view app_owner.v_note as select id, note from app_owner.t_order;")
+    drop = "alter table app_owner.t_order drop column note"
+    doc = p.preview("drop.sql", drop)
+    assert [b[0] for b in doc["rehearsal"]["broken"]] == ["v_note"], doc["rehearsal"]
+    assert "column or constraint" in doc["destructive"], doc
+    p.approve(doc["token"])
+    run_batches(entry, DB, "create view app_owner.v_note2 as select note from app_owner.t_order;")
+    code, _, why = p.confirm("apply", "drop.sql", "--confirm", doc["token"])
+    assert code == 1 and "v_note2" in why and "moved" in why, why
+    assert scalar(entry, "select columnproperty(object_id('app_owner.t_order'), 'note', 'ColumnId')")
+    ok("a verification that moved after approval is rolled back")
+    doc = p.preview("drop.sql", drop)
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "drop.sql", "--confirm", doc["token"])
+    assert code == 3 and {b[0] for b in res["broken"]} == {"v_note", "v_note2"}, (code, why, res)
+    assert scalar(entry, "select columnproperty(object_id('app_owner.t_order'), "
+                         "'note', 'ColumnId')") is None
+    ok("an approved breakage lands, and exits 3 with what broke")
+
+
+def _triggers(entry, p):
+    run_batches(entry, DB, "create table app_owner.t_hold (id int primary key, v int);\nGO\n"
+                           "insert into app_owner.t_hold values (1, 0);\nGO\n"
+                           "create trigger app_owner.trg_hold on app_owner.t_hold after update "
+                           "as begin commit; end")
+    value = "select v from app_owner.t_hold where id = 1"
+    doc = p.preview("hold.sql", "update app_owner.t_hold set v = 1 where id = 1")
+    assert any("3609" in n for n in doc["rehearsal"]["notes"]), doc["rehearsal"]
+    assert scalar(entry, value) == 0
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "hold.sql", "--confirm", doc["token"])
+    assert code == 0 and scalar(entry, value) == 1, (code, why, res)
+    ok("a trigger's single COMMIT commits nothing in a preview; the approval does")
+
+    run_batches(entry, DB, "alter trigger app_owner.trg_hold on app_owner.t_hold after update "
+                           "as begin while @@trancount > 0 commit; end")
+    code, out, why = p.run("apply", p.file("hold.sql", "update app_owner.t_hold set v = 2 "
+                                                       "where id = 1"))
+    assert code == 3 and "WRITTEN?" in out and "trg_hold" in out, (code, why, out)
+    assert "nothing was written" not in (out + why).lower()
+    assert scalar(entry, value) == 2                       # committed by the trigger
+    ok("a trigger that commits past the rehearsal: WRITTEN?, exit 3 — never 'nothing written'")
+
+    run_batches(entry, DB, "alter trigger app_owner.trg_hold on app_owner.t_hold after update "
+                           "as begin if exists (select 1 from inserted where v > 100) begin "
+                           "raiserror('v too large', 16, 1); rollback; end end")
+    code, _, why = p.run("apply", p.file("hold.sql", "update app_owner.t_hold set v = 101 "
+                                                     "where id = 1"))
+    assert code == 1 and "v too large" in why and "nothing was written" in why, why
+    assert scalar(entry, value) == 2
+    ok("a trigger that rolls back: refused, and nothing was written")
+
+    run_batches(entry, DB, "create trigger ddl_hold on database for create_procedure "
+                           "as begin commit; end")
+    try:
+        doc = p.preview("ddl.sql", "create procedure app_owner.p_ddl as select 1 as one")
+        assert any("3609" in n for n in doc["rehearsal"]["notes"]), doc["rehearsal"]
+        assert scalar(entry, "select object_id('app_owner.p_ddl')") is None
+    finally:
+        run_batches(entry, DB, "drop trigger ddl_hold on database")
+    ok("a DDL trigger's COMMIT commits nothing either")
+
+
 def main():
     env = os.environ
     if not env.get("PYTHIA_MSSQL_LIVE_HOST"):
@@ -239,6 +469,7 @@ def main():
     agent = load_fixture(entry)
     p = check_reads(agent)
     ddl_round_trip(entry, p)
+    check_writes(entry)
     print("OK")
 
 

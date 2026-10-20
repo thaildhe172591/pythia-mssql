@@ -1,12 +1,13 @@
 """SQL Server, through pymssql, as a pythia-core engine.
 
-It answers the connect tier (here) and the read tier (read.py). SQL Server
-runs DDL inside a transaction, as PostgreSQL does, so the write tier will
-rehearse each statement the same way (Phase 4b).
+It answers the connect tier (here), the read tier (read.py) and the write
+tier (write.py). SQL Server runs DDL inside a transaction, as PostgreSQL
+does, so every statement is rehearsed — run, verified by binding the
+modules around it, rolled back — before anyone approves it.
 """
 import sys
 
-from . import __version__, read
+from . import __version__, read, write
 from .catalog import QUERY_BINDS, QUERY_DIR, fold, q  # noqa: F401 — QUERY_* re-exported
 
 CONFIG_REL = ".pythia/mssql/connections.json"
@@ -22,6 +23,18 @@ class SqlServerEngine:
     version = __version__
     bind_style = "pyformat"
     default_port = 1433
+    rollback_notes = {
+        "source": "Yes — the definition is snapshotted before every write; a "
+                  "new object's undo is a DROP. An encrypted module is refused.",
+        "comments": "Yes — the previous MS_Description is snapshotted.",
+        "data_dml": "No. After commit only a backup, or a restore of the log to "
+                    "a point in time, brings rows back. Revalidation checks the "
+                    "rows; it is not an undo.",
+        "structural": "No. A dropped column or table is gone; the rehearsal "
+                      "shows what breaks before anything commits.",
+        "grants": "By hand — write the opposite GRANT, REVOKE or DENY.",
+        "session": "Not needed — it ends with the connection.",
+    }
 
     # --- the connection's life ------------------------------------------------
 
@@ -140,3 +153,36 @@ class SqlServerEngine:
 
     def compile_errors(self, conn, schema, name):
         return read.compile_errors(conn, schema, name, self.driver_errors())
+
+    # --- the write tier (write.py) -----------------------------------------------
+
+    def classify(self, text):
+        return write.classify(text)
+
+    def prepare_statement(self, text, group):
+        return write.prepare_statement(text, group)
+
+    def parse_object(self, stmt, group):
+        return write.parse_object(stmt, group)
+
+    def destructive_reason(self, stmt, group):
+        return write.destructive_reason(stmt, group)
+
+    def dml_probe(self, stmt):
+        return write.dml_probe(stmt)
+
+    def measure_row_set(self, conn, target, pred):
+        return write.measure_row_set(conn, target, pred)
+
+    def snapshot(self, conn, schema, group, ident):
+        return write.snapshot(conn, schema, group, ident)
+
+    def rehearse(self, conn, schema, group, stmt, ident, snapshot):
+        return write.rehearse(conn, schema, group, stmt, ident, snapshot,
+                              self.driver_errors())
+
+    def restore_statement(self, group, ident, before, outcome):
+        return write.restore_statement(group, ident, before, outcome)
+
+    def privilege_warning(self, conn, schema):
+        return write.privilege_warning(conn, schema)

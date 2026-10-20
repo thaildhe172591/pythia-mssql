@@ -1,10 +1,10 @@
 # Working in this repository / with this tool
 
 pythia-mssql is pythia for SQL Server, on pythia-core. It is pre-alpha
-(Phase 4a): it reads everything pythia's Learn movement needs, and writes
-nothing yet.
+(Phase 4b): it reads everything pythia's Learn movement needs, and writes
+through one gate. The guard, `install` and the skills come in Phase 4c.
 
-## Using pythia-mssql as an agent (Phase 4a)
+## Using pythia-mssql as an agent (Phase 4b)
 
 1. **Ask the database, never the dump.** `ls`, `src`, `cols`, `ddl`, `grep`
    against the live schema; `check` says where unqualified names land (the
@@ -15,21 +15,40 @@ nothing yet.
    developer the list before writing code. Rows marked `[text]` are leads
    found by name in module text (dynamic SQL), not proofs. Relay the `blind
    spot` lines, and never call an impact list complete.
-3. **"Not verified" is said plainly.** `errors` binds every module now, the
+3. **Writes go through `pythia-mssql apply` only, one statement per file.**
+   Never write through `sqlcmd`, SSMS, `Invoke-Sqlcmd` or a driver script:
+   those have no snapshot, no rehearsal and no journal. (The guard that
+   enforces this arrives in Phase 4c; until then it is this rule.)
+4. **The developer sees every preview.** Relay `apply`'s preview verbatim:
+   the diff, the rehearsal (what broke, or NOT VERIFIED), the rows, the
+   destructive and trigger notes. Then ask the developer to run
+   `pythia-mssql approve <token>` in their own terminal — you cannot run
+   it. Pass `--confirm <token>` only after they say they approved. `--yes`
+   and loosening `policy` are the developer's actions, at a console.
+5. **Scope is what was asked.** Dependents that break are reported with a
+   proposal, never fixed on your own initiative.
+6. **Exit codes are the verdict:** `0` clean · `1` refused (relay the
+   reason; do not route around it) · `3` written but broken — never report
+   success; show the errors and the printed restore command. Never read
+   `$?` through a pipe.
+7. **`WRITTEN?` means it may be written.** When a trigger ended the
+   transaction a rehearsal runs in, the preview itself may have committed
+   the statement. Stop, show the developer the output verbatim, and let
+   them look before anything else runs — never call it refused or
+   unwritten.
+8. **Restores are writes.** `journal restore` previews and needs the same
+   approval as any apply.
+9. **"Not verified" is said plainly.** `errors` binds every module now, the
    way SQL Server would when it runs; dynamic SQL inside a module is named
    as unchecked. Never report a `NOT VERIFIED` line as "no errors".
-4. **Truncation is always announced.** If output has no truncation marker,
-   you saw everything. If it has one, say so or fetch the rest with
-   `--offset`.
-5. **It writes nothing yet, so neither do you through it.** Until `apply`
-   exists (Phase 4b), propose a change as a file and let the developer run
-   it. Never write through `sqlcmd`, SSMS or a driver script on
-   pythia-mssql's behalf.
-6. **Never open `.pythia/mssql/connections.json`.** It holds passwords.
-   `pythia-mssql connections` lists the names, users, schemas and targets
-   without them.
-7. **Exit codes are the verdict:** `0` clean, `1` refused. Relay the reason;
-   do not route around it. Never read `$?` through a pipe.
+10. **Truncation is always announced.** If output has no truncation marker,
+    you saw everything. If it has one, say so or fetch the rest with
+    `--offset`.
+11. **Never open `.pythia/mssql/connections.json`, or anything under
+    `.pythia/mssql/grants/`.** The first holds passwords;
+    `pythia-mssql connections` lists the names, users, schemas and targets
+    without them. A grant written by anyone but `approve` is a forged
+    approval.
 
 ## Changing pythia-mssql itself
 
