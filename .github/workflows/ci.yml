@@ -29,18 +29,18 @@ jobs:
 
   live:
     # a disposable server per run; never a shared one
+    strategy:
+      fail-fast: false
+      matrix:
+        mssql: ["2017", "2019", "2022", "2025"]
     runs-on: ubuntu-latest
     services:
       mssql:
-        image: mcr.microsoft.com/mssql/server:2022-latest
+        image: mcr.microsoft.com/mssql/server:${{ matrix.mssql }}-latest
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: "CiOnly#Disposable1"
         ports: ["1433:1433"]
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa
-          -P CiOnly#Disposable1 -Q 'select 1' -b"
-          --health-interval 10s --health-timeout 5s --health-retries 24
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/checkout-core
@@ -50,6 +50,21 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install ./.core .
+      # the image's own sqlcmd moved between versions: wait with pymssql
+      - name: wait for SQL Server ${{ matrix.mssql }}
+        run: |
+          python - <<'PY'
+          import time, pymssql
+          for _ in range(60):
+              try:
+                  pymssql.connect(server="127.0.0.1", port=1433, user="sa",
+                                  password="CiOnly#Disposable1", login_timeout=5).close()
+                  break
+              except pymssql.Error:
+                  time.sleep(3)
+          else:
+              raise SystemExit("SQL Server did not answer")
+          PY
       - run: python tests/live_check.py
         env:
           PYTHIA_MSSQL_LIVE_HOST: 127.0.0.1
