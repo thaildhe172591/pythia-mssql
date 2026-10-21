@@ -1,5 +1,7 @@
 # pythia-mssql
 
+**English** · [Tiếng Việt](https://github.com/thaildhe172591/pythia-mssql/blob/main/README.vi.md)
+
 pythia for SQL Server: T-SQL development for AI agents, built on
 [pythia-core](https://github.com/thaildhe172591/pythia-core). It aims to do
 what [pythia](https://github.com/thaildhe172591/pythia) does on Oracle and
@@ -8,8 +10,7 @@ PostgreSQL: the agent learns from the live catalog, asks a person before
 any write, and writes only through a gate that snapshots, verifies and
 reports honestly.
 
-**Pre-alpha (Phase 4c).** It reads everything pythia's Learn movement
-needs, writes through one gate, and wires a project for an agent: the
+**Alpha (0.1.0).** It reads everything pythia's Learn movement needs, writes through one gate, and wires a project for an agent: the
 guard, the session brief, the approval doors and the `pythia-mssql-*`
 skills.
 
@@ -19,15 +20,20 @@ skills.
 | writes: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | the harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
-## Install (from git while pre-alpha)
+## Install
+
+```bash
+pip install pythia-mssql
+```
+
+That brings pythia-core, and [pymssql](https://pypi.org/project/pymssql/),
+whose wheels carry FreeTDS: no ODBC driver needs installing, on Windows,
+macOS or Linux. The development version is the main branch of both:
 
 ```bash
 pip install "git+https://github.com/thaildhe172591/pythia-core" \
             "git+https://github.com/thaildhe172591/pythia-mssql"
 ```
-
-That brings [pymssql](https://pypi.org/project/pymssql/), whose wheels carry
-FreeTDS: no ODBC driver needs installing, on Windows, macOS or Linux.
 
 ## Set up a project for an agent
 
@@ -77,11 +83,16 @@ write spelled in a way it does not list. It sees the commands Claude Code
 hands its Bash tool, not SSMS or Azure Data Studio. The gate behind it
 holds either way (pythia-core's SECURITY.md).
 
+pythia-postgres and pythia-mongo install beside it in one project, and
+pythia for Oracle too: each keeps the others' hooks and instruction blocks,
+and each guard and approval hook acts for its own tool only (pythia-core's
+CI checks it with all four installed).
+
 ## Connections
 
 `.pythia/mssql/connections.json` in the project root, owner-readable only
 (`chmod 600`), and out of git. Template:
-[examples/connections.example.json](examples/connections.example.json).
+[examples/connections.example.json](https://github.com/thaildhe172591/pythia-mssql/blob/main/examples/connections.example.json).
 
 ```json
 {
@@ -104,8 +115,9 @@ holds either way (pythia-core's SECURITY.md).
   the only entry, the folder directly under the project root, then
   `"default"`. `PYTHIA_MSSQL_CONFIG` points at another file.
 
-pythia for Oracle keeps `.pythia/connections.json` and pythia-postgres
-`.pythia/postgres/`; pythia-mssql reads neither.
+pythia for Oracle keeps `.pythia/connections.json`, pythia-postgres
+`.pythia/postgres/` and pythia-mongo `.pythia/mongo/`; pythia-mssql reads
+none of them.
 
 ## Commands
 

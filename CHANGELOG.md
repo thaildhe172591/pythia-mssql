@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.0 — 2026-10-21
+
+The first release, and the first on PyPI: alpha, on pythia-core 0.1.0.
+Everything in the development versions below — 0.1.0.dev0 to 0.3.0.dev0,
+never published — is in it.
+
+- **Version 0.1.0**, asking for `pythia-core>=0.1.0,<0.2`.
+- **README.vi.md**, the README in Vietnamese; a test holds the two to the
+  same headings and the same commands.
+- **`release.yml`:** a `vX.Y.Z` tag runs the suite against pythia-core's
+  main, checks that pyproject.toml, `__version__` and this file name that
+  version, and publishes to PyPI by trusted publishing (no token stored
+  anywhere).
+- **PyPI metadata:** the README as the project page, classifiers (Alpha,
+  Python 3.9 to 3.13), and links to the changelog and the issues.
+
 ## 0.3.0.dev0 — unreleased
 
 Phase 4c of the plan in pythia-core's DESIGN.md: the harness, release and

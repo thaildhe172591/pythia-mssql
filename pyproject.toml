@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pythia-mssql"
-version = "0.3.0.dev0"
+version = "0.1.0"
 description = "pythia for SQL Server: T-SQL development for AI agents over pythia-core - catalog queries, impact analysis and a rehearsed, approved write path."
 readme = "README.md"
 license = "MIT"
@@ -12,11 +12,27 @@ license-files = ["LICENSE"]
 requires-python = ">=3.9"
 # pythia-core and the driver, nothing else (tests/test_mssql.py). pymssql's
 # wheels carry FreeTDS, so no ODBC driver needs installing (DESIGN.md §8).
-dependencies = ["pythia-core>=0.9.0.dev0", "pymssql>=2.3"]
+dependencies = ["pythia-core>=0.1.0,<0.2", "pymssql>=2.3"]
 keywords = ["sql-server", "mssql", "t-sql", "database", "agent-skills"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development",
+]
 
 [project.urls]
 Repository = "https://github.com/thaildhe172591/pythia-mssql"
+Changelog = "https://github.com/thaildhe172591/pythia-mssql/blob/main/CHANGELOG.md"
+Issues = "https://github.com/thaildhe172591/pythia-mssql/issues"
 
 [project.scripts]
 pythia-mssql = "pythia_mssql.cli:main"
