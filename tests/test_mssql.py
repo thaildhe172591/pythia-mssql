@@ -309,6 +309,24 @@ def test_check_end_to_end_and_reads_never_commit():
     assert conn.closed is True and conn.commits == 0   # closing rolls it back
 
 
+def test_check_warns_below_sql_server_2017_and_refuses_nothing():
+    for version, said in (("13.0.7037.1", "SQL Server 2016"), ("12.0.6449.1", "SQL Server 2014"),
+                          ("11.0.7507.2", "SQL Server 2012")):
+        answers = dict(BASIC)
+        answers["server-version.sql"] = (("version", "edition", "database_name"),
+                                         [(version, "Standard Edition (64-bit)", "app")])
+        with fake_pymssql(answers), project(DEV):
+            code, out, _ = run("check")
+        assert code == 0 and f"! {said} is below pythia-mssql's floor, 2017" in out, out
+    for version in ("14.0.3485.1", "17.0.1000.7"):          # 2017, and 2025
+        answers = dict(BASIC)
+        answers["server-version.sql"] = (("version", "edition", "database_name"),
+                                         [(version, "Developer Edition (64-bit)", "app")])
+        with fake_pymssql(answers), project(DEV):
+            code, out, _ = run("check", "--json")
+        assert code == 0 and json.loads(out)["below_floor"] is None, version
+
+
 def test_check_reports_the_default_schema_drift():
     answers = dict(BASIC)
     answers["current-schema.sql"] = (("current_schema",), [("dbo",)])
@@ -1200,7 +1218,8 @@ def test_the_release_workflow_checks_the_tag_against_the_version():
 
 def test_it_asks_for_the_core_of_its_release_series():
     # 0.x: a minor version of pythia-core may change the engine contract
-    assert '"pythia-core>=0.1.0,<0.2"' in pyproject()
+    assert re.search(r'"pythia-core>=0\.1\.\d+,<0\.2"', pyproject()), \
+        "pythia-core is asked for outside its 0.1 series"
 
 
 def readme_shape(text):

@@ -10,7 +10,7 @@ làm trên PostgreSQL: agent học từ catalog đang chạy, hỏi một ngư�
 lần ghi, và chỉ ghi qua một cổng có snapshot, có kiểm chứng và báo cáo trung
 thực.
 
-**Alpha (0.1.0).** Nó đọc được mọi thứ mà nhịp Học của pythia cần, ghi qua
+**Alpha (0.1.1).** Nó đọc được mọi thứ mà nhịp Học của pythia cần, ghi qua
 một cổng duy nhất, và chuẩn bị một project cho agent: guard, bản tóm tắt đầu
 phiên, các cánh cửa duyệt và các skill `pythia-mssql-*`.
 
@@ -19,6 +19,11 @@ phiên, các cánh cửa duyệt và các skill `pythia-mssql-*`.
 | đọc: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` |
 | ghi: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
+
+Đã test trên SQL Server 2017, 2019, 2022 và 2025, mỗi bản qua toàn bộ live
+check; 2017 là phiên bản tối thiểu, và thấp hơn thì `check` nói rõ (không
+gì bị từ chối). SQL Server 2016 không có image Linux để test, và đã hết
+extended support từ tháng 7/2026.
 
 ## Cài đặt
 

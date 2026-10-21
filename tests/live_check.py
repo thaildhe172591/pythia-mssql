@@ -155,7 +155,8 @@ def check_connect(entry):
     doc = p.json("check")
     server = {r["ITEM"]: r["VALUE"] for r in doc["rows"]}["server"]
     assert server.startswith("SQL Server ") and "database master" in server, server
-    ok(f"check: {server}")
+    assert doc["below_floor"] is None, doc["below_floor"]    # CI runs 2017 and up
+    ok(f"check: {server}, at or above the floor")
 
 
 def load_fixture(entry):

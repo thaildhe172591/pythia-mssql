@@ -10,7 +10,7 @@ PostgreSQL: the agent learns from the live catalog, asks a person before
 any write, and writes only through a gate that snapshots, verifies and
 reports honestly.
 
-**Alpha (0.1.0).** It reads everything pythia's Learn movement needs, writes through one gate, and wires a project for an agent: the
+**Alpha (0.1.1).** It reads everything pythia's Learn movement needs, writes through one gate, and wires a project for an agent: the
 guard, the session brief, the approval doors and the `pythia-mssql-*`
 skills.
 
@@ -19,6 +19,11 @@ skills.
 | reads: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` |
 | writes: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | the harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
+
+SQL Server 2017, 2019, 2022 and 2025 are tested, each through the whole
+live check; 2017 is the floor, and below it `check` says so (nothing is
+refused). SQL Server 2016 has no Linux image to test on, and its extended
+support ended in July 2026.
 
 ## Install
 

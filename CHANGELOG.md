@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.1 — unreleased
+
+Phase 8 of the plan in pythia-core's DESIGN.md: the minimum version, on
+pythia-core 0.1.1.
+
+- **SQL Server 2017 is the floor**, where 2016 was promised and never
+  tested. CI runs the whole live check on SQL Server 2017, 2019, 2022 and
+  2025, and waits for each with pymssql: the image's own `sqlcmd` moved
+  between versions. 2016 has no Linux image, and its extended support ended
+  in July 2026. Below the floor `check` says so — from the major version
+  `ProductVersion` begins with — and nothing is refused.
+- Asks for `pythia-core>=0.1.1,<0.2`.
+
 ## 0.1.0 — 2026-10-21
 
 The first release, and the first on PyPI: alpha, on pythia-core 0.1.0.

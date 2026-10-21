@@ -12,6 +12,11 @@ import sys
 from . import __version__, guard, read, write
 from .catalog import QUERY_BINDS, QUERY_DIR, fold, q  # noqa: F401 — QUERY_* re-exported
 
+# SQL Server's major version, as ProductVersion begins: the year it shipped
+RELEASES = {11: "2012", 12: "2014", 13: "2016", 14: "2017", 15: "2019", 16: "2022",
+            17: "2025"}
+FLOOR = 14              # SQL Server 2017: the oldest CI tests, and the oldest on Linux
+
 CONFIG_REL = ".pythia/mssql/connections.json"
 REQUIRED = ("host", "database", "user")
 ENCRYPT = ("off", "request", "require")
@@ -125,6 +130,19 @@ class SqlServerEngine:
     def server_version(self, conn):
         version, edition, database = q(conn, "server-version.sql")[1][0]
         return f"SQL Server {version} ({edition}) — database {database}"
+
+    def floor_warning(self, conn):
+        """Below SQL Server 2017, the oldest version CI tests: said by `check`,
+        never refused (pythia-core DESIGN.md §8, question 2)."""
+        version = str(q(conn, "server-version.sql")[1][0][0])
+        major = int(version.split(".")[0])
+        if major >= FLOOR:
+            return None
+        name = RELEASES.get(major, f"version {version}")
+        return (f"SQL Server {name} is below pythia-mssql's floor, 2017: it is not "
+                "tested there (CI runs 2017 to 2025, and Microsoft publishes no "
+                "Linux image of anything older), and Microsoft no longer supports "
+                "it. Most commands may still work.")
 
     def current_schema(self, conn):
         rows = q(conn, "current-schema.sql")[1]

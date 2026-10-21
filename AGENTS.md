@@ -1,6 +1,6 @@
 # Working in this repository / with this tool
 
-pythia-mssql is pythia for SQL Server, on pythia-core. It is alpha (0.1.0):
+pythia-mssql is pythia for SQL Server, on pythia-core. It is alpha (0.1.1):
 it reads everything pythia's Learn movement needs, and writes through one
 gate. `pythia-mssql install` wires a project: the guard, the session brief
 and the `pythia-mssql-*` skills (`using-pythia-mssql` routes).
@@ -80,8 +80,9 @@ and the `pythia-mssql-*` skills (`using-pythia-mssql` routes).
   (the engine turns it back into `%`: pymssql never does), never a `%(`
   that is not a bind (pymssql reads it as one even inside a literal), the
   `-- Purpose / -- Binds / -- Returns` header, and an entry in
-  `QUERY_BINDS`. SQL Server 2016 is the floor: no `STRING_AGG`, no
-  `STRING_SPLIT(..., 1)`.
+  `QUERY_BINDS`. SQL Server 2017 is the floor: CI runs the live check on 2017
+  to 2025, and nothing newer than 2017 belongs in a query (no
+  `STRING_SPLIT(..., 1)`, `GREATEST`, `DATETRUNC`).
 - **Dependencies:** pythia-core and pymssql, nothing else (a test enforces
   it).
 - **Engine-neutral logic goes to pythia-core.** If an answer would be the
